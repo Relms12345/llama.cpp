@@ -128,7 +128,7 @@ public:
 };
 
 llama_model_vllm_decision2::graph::graph(const llama_model & model_base, const llm_graph_params & params) :
-    llama_model_qwen3::graph(params, no_build()), model(static_cast<const llama_model_vllm_decision2 &>(model_base)) {
+    llama_model_qwen3::graph<false>(params, no_build()), model(static_cast<const llama_model_vllm_decision2 &>(model_base)) {
     auto inp_decision_ptr = std::make_unique<input_decision>(ubatch);
     auto * inp_decision   = inp_decision_ptr.get();
     res->add_input(std::move(inp_decision_ptr));
