@@ -77,11 +77,15 @@ template <bool iswa>
 llama_model_qwen3::graph<iswa>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = build_backbone(model);
 
-    // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    // skip lm_head in embedding mode with pooling=none (logit tensor is too large for long-context)
+    if (!cparams.embeddings || pooling_type != LLAMA_POOLING_TYPE_NONE) {
+        cur = build_lora_mm(model.output, cur, model.output_s);
 
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+
+        ggml_build_forward_expand(gf, cur);
+    }
 }
 
 template <bool iswa>
