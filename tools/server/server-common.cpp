@@ -969,6 +969,379 @@ server_tokens process_mtmd_prompt(
     return result;
 }
 
+static std::string sanitize_jina_rerank_text(std::string text) {
+    string_replace_all(text, "<|embed_token|>", "");
+    string_replace_all(text, "<|rerank_token|>", "");
+    string_replace_all(text, "<|score_token|>", "");
+    return text;
+}
+
+static std::pair<std::string, size_t> jina_rerank_encode_len(
+        const llama_vocab * vocab,
+        const std::string & text_in,
+        size_t max_len) {
+
+    // Preserve our existing protection against users injecting the
+    // Jina control markers.
+    std::string text =
+        sanitize_jina_rerank_text(text_in);
+
+    // User text must NOT interpret special-token syntax.
+    auto tokens = common_tokenize(
+        vocab,
+        text,
+        false,  // add_special
+        false   // parse_special
+    );
+
+    // Match the reference implementation:
+    //
+    //     if len(ids) >= max_len:
+    //         ids = ids[:max_len]
+    //
+    if (tokens.size() >= max_len) {
+        tokens.resize(max_len);
+
+        // llama.cpp already provides a vocab-based detokenizer,
+        // so tokenizer.json is not needed.
+        text = common_detokenize(
+            vocab,
+            tokens,
+            false
+        );
+    }
+
+    return {
+        std::move(text),
+        tokens.size()
+    };
+}
+
+jina_rerank_block_plan make_jina_rerank_blocks(
+        const llama_vocab * vocab,
+        const std::string & query_in,
+        const std::vector<std::string> & documents_in,
+        size_t block_size,
+        size_t max_length,
+        size_t max_query_length,
+        size_t max_doc_length,
+        size_t tokens_per_batch) {
+
+    GGML_ASSERT(vocab != nullptr);
+    GGML_ASSERT(block_size > 0);
+    GGML_ASSERT(max_doc_length > 1);
+    GGML_ASSERT(max_query_length > 64);
+    GGML_ASSERT(max_length > 0);
+    GGML_ASSERT(tokens_per_batch > 0);
+
+    jina_rerank_block_plan result;
+
+    // ---------------------------------------------------------------------
+    // 1. Truncate documents.
+    //
+    // Reference:
+    //
+    //     max_len = max_doc_length - 1
+    //
+    // One token is reserved for <|embed_token|>.
+    // ---------------------------------------------------------------------
+
+    std::vector<size_t> doc_lengths;
+
+    result.documents.reserve(documents_in.size());
+    doc_lengths.reserve(documents_in.size());
+
+    for (const auto & raw_doc : documents_in) {
+        auto encoded = jina_rerank_encode_len(
+            vocab,
+            raw_doc,
+            max_doc_length - 1
+        );
+
+        result.documents.push_back(
+            std::move(encoded.first)
+        );
+
+        doc_lengths.push_back(
+            encoded.second
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 2. Truncate query.
+    //
+    // Reference reserves 64 tokens for prompt scaffolding.
+    //
+    //     max_len = max_query_length - 64
+    // ---------------------------------------------------------------------
+
+    {
+        auto encoded = jina_rerank_encode_len(
+            vocab,
+            query_in,
+            max_query_length - 64
+        );
+
+        result.query =
+            std::move(encoded.first);
+
+        const size_t query_length =
+            encoded.second;
+
+        // -----------------------------------------------------------------
+        // 3. Pack documents into blocks.
+        //
+        // This mirrors the current GGUF reference flush loop.
+        // -----------------------------------------------------------------
+
+        const int64_t batch_flush_threshold =
+            (int64_t) tokens_per_batch -
+            (int64_t) max_doc_length;
+
+        std::vector<std::string> block_docs;
+
+        block_docs.reserve(
+            std::min(
+                block_size,
+                result.documents.size()
+            )
+        );
+
+        size_t block_doc_tokens = 0;
+
+        for (size_t i = 0;
+             i < result.documents.size();
+             ++i) {
+
+            const size_t length =
+                doc_lengths[i];
+
+            const auto & doc =
+                result.documents[i];
+
+            // -------------------------------------------------------------
+            // Try adding this document to the current block.
+            // -------------------------------------------------------------
+
+            block_docs.push_back(doc);
+
+            // The approximate reference-compatible accounting above does
+            // not include the complete formatted prompt scaffolding or the
+            // duplicated query.
+            //
+            // Enforce the actual llama.cpp tokenized prompt size as a hard
+            // limit so a block can never exceed the real slot context.
+            const size_t formatted_tokens =
+                format_prompt_rerank_jina(
+                    vocab,
+                    result.query,
+                    block_docs
+                ).size();
+
+            if (formatted_tokens >= max_length) {
+                // The newly added document made this block too large.
+                //
+                // Flush the previous documents and begin a new block with
+                // this document.
+                if (block_docs.size() > 1) {
+                    std::string overflow_doc =
+                        std::move(block_docs.back());
+
+                    block_docs.pop_back();
+
+                    result.blocks.push_back(
+                        std::move(block_docs)
+                    );
+
+                    block_docs.clear();
+                    block_docs.reserve(
+                        std::min(
+                            block_size,
+                            result.documents.size() - i
+                        )
+                    );
+
+                    block_docs.push_back(
+                        std::move(overflow_doc)
+                    );
+
+                    block_doc_tokens = length;
+
+                    // A single document must fit by itself. The dynamic
+                    // max_doc_length calculation should guarantee this.
+                    //
+                    // Keep this check here so future changes cannot silently
+                    // create a request that llama-server will reject later.
+                    const size_t single_doc_tokens =
+                        format_prompt_rerank_jina(
+                            vocab,
+                            result.query,
+                            block_docs
+                        ).size();
+
+                    if (single_doc_tokens >= max_length) {
+                        throw std::runtime_error(
+                            string_format(
+                                "Jina reranker: single-document formatted prompt "
+                                "requires %zu tokens but slot context is %zu",
+                                single_doc_tokens,
+                                max_length
+                            )
+                        );
+                    }
+
+                } else {
+                    // Even this document by itself does not fit.
+                    //
+                    // This should be prevented by JINA_MAX_DOC_LENGTH, but
+                    // fail here with the real sizes rather than handing an
+                    // impossible task to the scheduler.
+                    throw std::runtime_error(
+                        string_format(
+                            "Jina reranker: single-document formatted prompt "
+                            "requires %zu tokens but slot context is %zu",
+                            formatted_tokens,
+                            max_length
+                        )
+                    );
+                }
+
+            } else {
+                block_doc_tokens += length;
+            }
+
+            // -------------------------------------------------------------
+            // Preserve the reference implementation's normal flush rules,
+            // with the exact formatted-prompt limit above acting as a hard safety bound.
+            // -------------------------------------------------------------
+
+            const int64_t length_capacity =
+                (int64_t) max_length -
+                (int64_t) query_length -
+                (int64_t) block_doc_tokens;
+
+            const int64_t current_tokens =
+                (int64_t) query_length +
+                (int64_t) block_doc_tokens;
+
+            const bool flush =
+                block_docs.size() >= block_size ||
+
+                length_capacity <
+                    (int64_t) max_doc_length ||
+
+                current_tokens >=
+                    batch_flush_threshold;
+
+            if (flush) {
+                result.blocks.push_back(
+                    std::move(block_docs)
+                );
+
+                block_docs.clear();
+
+                block_docs.reserve(
+                    std::min(
+                        block_size,
+                        result.documents.size() - i - 1
+                    )
+                );
+
+                block_doc_tokens = 0;
+            }
+        }
+
+        // Final partial block.
+        if (!block_docs.empty()) {
+            result.blocks.push_back(
+                std::move(block_docs)
+            );
+        }
+    }
+
+    return result;
+}
+
+server_tokens format_prompt_rerank_jina(
+        const llama_vocab * vocab,
+        const std::string & query_in,
+        const std::vector<std::string> & documents_in) {
+
+    const std::string query = sanitize_jina_rerank_text(query_in);
+
+    std::vector<std::string> documents;
+    documents.reserve(documents_in.size());
+
+    for (const auto & doc : documents_in) {
+        documents.push_back(sanitize_jina_rerank_text(doc));
+    }
+
+    std::string prompt;
+
+    prompt += "<|im_start|>system\n";
+    prompt +=
+        "You are a search relevance expert who can determine a ranking of the passages "
+        "based on how relevant they are to the query. "
+        "If the query is a question, how relevant a passage is depends on how well it "
+        "answers the question. "
+        "If not, try to analyze the intent of the query and assess how well each passage "
+        "satisfies the intent. "
+        "If an instruction is provided, you should follow the instruction when determining "
+        "the ranking.";
+    prompt += "<|im_end|>\n";
+    prompt += "<|im_start|>user\n";
+
+    prompt += "I will provide you with ";
+    prompt += std::to_string(documents.size());
+    prompt +=
+        " passages, each indicated by a numerical identifier. "
+        "Rank the passages based on their relevance to query: ";
+    prompt += query;
+
+    // Early query representation for dual matching.
+    prompt += "<|rerank_token|>\n";
+
+    for (size_t i = 0; i < documents.size(); ++i) {
+        prompt += "<passage id=\"";
+        prompt += std::to_string(i);
+        prompt += "\">\n";
+
+        prompt += documents[i];
+        prompt += "<|embed_token|>\n";
+
+        prompt += "</passage>\n";
+    }
+
+    // Late query representation -- this is the one we'll score against.
+    prompt += "<query>\n";
+    prompt += query;
+    prompt += "<|rerank_token|>\n";
+    prompt += "</query>";
+
+    prompt +=
+        "\nPlease provide the ranking of all passages based on their relevance "
+        "to the search query, in descending order of relevance, with each label "
+        "enclosed in square brackets (e.g., [2] > [1] > [3] > [0]).";
+
+    prompt += "<|im_end|>\n";
+    prompt += "<|im_start|>assistant\n";
+    prompt += "<think>\n\n</think>\n\n";
+
+    const auto tokens = common_tokenize(
+        vocab,
+        prompt,
+        false,
+        true
+    );
+
+    server_tokens result;
+    for (const auto token : tokens) {
+        result.push_back(token);
+    }
+
+    return result;
+}
+
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
  * use tokenize_input_prompts() if the input could be an array.

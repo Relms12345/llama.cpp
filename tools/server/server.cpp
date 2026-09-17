@@ -140,13 +140,45 @@ int llama_server(common_params & params, int argc, char ** argv) {
     common_params_print_info(params, !is_router_server);
 
     if (!is_router_server) {
-        // validate batch size for embeddings
-        // embeddings require all tokens to be processed in a single ubatch
-        // see https://github.com/ggml-org/llama.cpp/issues/12836
+        // Validate batch size for embeddings.
+        //
+        // Non-causal embedding models require the complete logical batch to fit
+        // in one physical ubatch because every token can attend to every other
+        // token.
+        //
+        // Causal embedding models do not have this restriction. llama_decode()
+        // can split the logical batch into smaller physical ubatches while
+        // preserving the KV state between them.
+        //
+        // This is important for causal embedding/reranking models such as the
+        // Jina reranker v3.5 Qwen3 backbone: forcing n_ubatch == n_batch for a
+        // long context causes unnecessarily huge compute buffers and excessive
+        // host RAM / VRAM usage.
+        //
+        // See:
+        // https://github.com/ggml-org/llama.cpp/issues/12836
         if (params.embedding && params.n_batch > params.n_ubatch) {
-            SRV_WRN("embeddings enabled with n_batch (%d) > n_ubatch (%d)\n", params.n_batch, params.n_ubatch);
-            SRV_WRN("setting n_batch = n_ubatch = %d to avoid assertion failure\n", params.n_ubatch);
-            params.n_batch = params.n_ubatch;
+            if (params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL) {
+                SRV_INF(
+                    "causal embeddings enabled with n_batch (%d) > n_ubatch (%d); "
+                    "allowing physical microbatching\n",
+                    params.n_batch,
+                    params.n_ubatch
+                );
+            } else {
+                SRV_WRN(
+                    "non-causal embeddings enabled with n_batch (%d) > n_ubatch (%d)\n",
+                    params.n_batch,
+                    params.n_ubatch
+                );
+
+                SRV_WRN(
+                    "setting n_batch = n_ubatch = %d to avoid assertion failure\n",
+                    params.n_ubatch
+                );
+
+                params.n_batch = params.n_ubatch;
+            }
         }
 
         if (params.n_parallel < 0) {

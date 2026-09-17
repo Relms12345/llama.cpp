@@ -655,6 +655,9 @@ struct llama_model {
     struct ggml_tensor * cls_out_b = nullptr;
     struct ggml_tensor * cls_norm  = nullptr;
 
+    struct ggml_tensor * rerank_proj_0 = nullptr;
+    struct ggml_tensor * rerank_proj_2 = nullptr;
+
     struct ggml_tensor * conv1d   = nullptr;
     struct ggml_tensor * conv1d_b = nullptr;
 

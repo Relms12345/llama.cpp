@@ -18,7 +18,9 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -353,6 +355,22 @@ struct server_slot {
     // corresponding to one token position (size = n_embd)
     std::vector<float> inp_embd;
 
+    // Jina v3.5 listwise reranker.
+    //
+    // A prompt may be processed across multiple logical llama_decode() calls when
+    // n_batch is smaller than the complete prompt. KV state survives between
+    // those calls, but embedding outputs from previous calls do not.
+    //
+    // Preserve the projected marker embeddings until the whole rerank prompt has
+    // finished.
+    struct jina_marker_output {
+        llama_pos pos = 0;
+        llama_token token = LLAMA_TOKEN_NULL;
+        std::vector<float> embd;
+    };
+
+    std::vector<jina_marker_output> jina_marker_outputs;
+
     server_slot_stats stats;
 
     // accepted tokens per draft position
@@ -386,6 +404,7 @@ struct server_slot {
         }
         generated_tokens.clear();
         generated_token_probs.clear();
+        jina_marker_outputs.clear();
         json_schema = json();
 
         task_prev = std::move(task);
@@ -438,16 +457,58 @@ struct server_slot {
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
     // also we cannot split if the pooling would require any past tokens
     // (MTP supports splitting — uses task->need_embd() not need_embd())
-    bool can_split() const {
+    bool can_split(bool allow_pooling_none = false) const {
         GGML_ASSERT(task);
 
-        return
-            !task->need_embd() ||
-            (llama_get_memory(ctx_tgt) && llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_LAST);
+        if (!task->need_embd()) {
+            return true;
+        }
+
+        // Embedding/reranking tasks require a memory module in order to
+        // process the logical batch as multiple physical ubatches.
+        if (!llama_get_memory(ctx_tgt)) {
+            return false;
+        }
+
+        const auto pooling = llama_pooling_type(ctx_tgt);
+
+        // Existing llama.cpp behavior.
+        if (pooling == LLAMA_POOLING_TYPE_LAST) {
+            return true;
+        }
+
+        // Causal pooling=none models can also be physically microbatched.
+        //
+        // This is opt-in because non-causal embedding models still require
+        // the whole prompt to fit inside one physical ubatch.
+        if (allow_pooling_none &&
+            pooling == LLAMA_POOLING_TYPE_NONE) {
+            return true;
+        }
+
+        return false;
     }
 
     bool can_batch_with(server_slot & other_slot) const {
         GGML_ASSERT(task);
+        GGML_ASSERT(other_slot.task);
+
+        // Jina v3.5 reranking is numerically sensitive to multiple sequences
+        // being evaluated together in the same llama_decode() batch.
+        //
+        // Keep -np > 1 available for slot/request scheduling, but never combine
+        // two causal pooling=none rerank tasks into the same model batch.
+        //
+        // This makes each Jina block evaluate with the same single-sequence
+        // execution shape as the validated -np 1/reference path.
+        const bool jina_rerank =
+            task->type == SERVER_TASK_TYPE_RERANK &&
+            other_slot.task->type == SERVER_TASK_TYPE_RERANK &&
+            llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_NONE;
+
+        if (jina_rerank) {
+            return false;
+        }
 
         return task->type == other_slot.task->type
             && inp_embd.size() == other_slot.inp_embd.size()
@@ -868,6 +929,18 @@ public:
         return metrics;
     }
 
+    bool is_jina_reranker_model() const {
+        return is_jina_reranker;
+    }
+
+    uint32_t context_size() const {
+        return n_ctx;
+    }
+
+    uint32_t slot_context_size() const {
+        return (uint32_t) n_ctx_slot();
+    }
+
     void reset_metrics_bucket() {
         metrics.reset_bucket();
     }
@@ -875,6 +948,11 @@ public:
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
+
+    // Jina v3.5 reranking stuff
+    bool is_jina_reranker = false;
+    llama_token jina_embed_token  = LLAMA_TOKEN_NULL;
+    llama_token jina_rerank_token = LLAMA_TOKEN_NULL;
 
     common_params params_base;
 
@@ -1096,6 +1174,37 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // -------------------------------------------------------------------------
+        // Causal pooling=none embedding contexts
+        //
+        // llama-embedding creates these contexts with n_seq_max set to
+        // llama_max_parallel_sequences(), even when invoked with -np 1.
+        //
+        // That context shape is numerically significant for causal physical
+        // microbatching (n_batch > n_ubatch), including Jina reranker v3.5.
+        //
+        // Keep the server's actual parallelism / slot count unchanged, but create
+        // the llama_context with llama-embedding-compatible n_seq_max and unified KV.
+        // -------------------------------------------------------------------------
+
+        const bool jina_embedding_context =
+            params_base.embedding &&
+            params_base.pooling_type == LLAMA_POOLING_TYPE_NONE &&
+            params_base.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
+
+        if (jina_embedding_context) {
+            params_base.n_seq_max_override = llama_max_parallel_sequences();
+            params_base.kv_unified = true;
+
+            SRV_INF(
+                "causal pooling=none embedding context: "
+                "using n_seq_max=%d, kv_unified=true "
+                "while keeping server parallelism=%d\n",
+                params_base.n_seq_max_override,
+                params_base.n_parallel
+            );
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -1112,6 +1221,67 @@ private:
         }
 
         vocab = llama_model_get_vocab(model_tgt);
+
+        // Reset Jina-specific state on every model load / resume.
+        is_jina_reranker  = false;
+        jina_embed_token  = LLAMA_TOKEN_NULL;
+        jina_rerank_token = LLAMA_TOKEN_NULL;
+
+        // Detect Jina reranker v3.5 from GGUF metadata.
+        {
+            char jina_type[64] = {};
+
+            if (llama_model_meta_val_str(
+                    model_tgt,
+                    "jina.reranker.type",
+                    jina_type,
+                    sizeof(jina_type)) > 0) {
+
+                is_jina_reranker =
+                    std::strcmp(jina_type, "v3.5-embed-match") == 0;
+            }
+        }
+
+        if (is_jina_reranker) {
+            const auto embed_ids = common_tokenize(
+                vocab,
+                "<|embed_token|>",
+                false,
+                true
+            );
+
+            const auto rerank_ids = common_tokenize(
+                vocab,
+                "<|rerank_token|>",
+                false,
+                true
+            );
+
+            if (embed_ids.size() != 1) {
+                SRV_ERR(
+                    "Jina reranker: <|embed_token|> tokenized to %zu tokens, expected exactly 1\n",
+                    embed_ids.size()
+                );
+                return false;
+            }
+
+            if (rerank_ids.size() != 1) {
+                SRV_ERR(
+                    "Jina reranker: <|rerank_token|> tokenized to %zu tokens, expected exactly 1\n",
+                    rerank_ids.size()
+                );
+                return false;
+            }
+
+            jina_embed_token  = embed_ids[0];
+            jina_rerank_token = rerank_ids[0];
+
+            SRV_INF(
+                "Jina reranker v3.5 detected: embed token = %d, rerank token = %d\n",
+                jina_embed_token,
+                jina_rerank_token
+            );
+        }
 
         n_ctx = llama_n_ctx(ctx_tgt);
 
@@ -2194,11 +2364,288 @@ private:
         queue_results.send(std::move(res));
     }
 
+    void collect_jina_rerank_outputs(server_slot & slot, const llama_batch & batch) {
+        if (!is_jina_reranker ||
+            slot.task == nullptr ||
+            slot.task->type != SERVER_TASK_TYPE_RERANK) {
+            return;
+        }
+
+        const int32_t n_embd =
+            llama_model_n_embd_out(model_tgt);
+
+        int32_t n_collected = 0;
+
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            if (!batch.logits[i]) {
+                continue;
+            }
+
+            if (batch.n_seq_id[i] < 1 ||
+                batch.seq_id[i][0] != slot.id) {
+                continue;
+            }
+
+            const llama_token tok = batch.token[i];
+
+            if (tok != jina_embed_token &&
+                tok != jina_rerank_token) {
+                continue;
+            }
+
+            const float * embd =
+                llama_get_embeddings_ith(ctx_tgt, i);
+
+            if (embd == nullptr) {
+                SLT_ERR(
+                    slot,
+                    "Jina reranker: missing embedding for "
+                    "marker pos=%d token=%d\n",
+                    batch.pos[i],
+                    tok
+                );
+                continue;
+            }
+
+            auto & output =
+                slot.jina_marker_outputs.emplace_back();
+
+            output.pos   = batch.pos[i];
+            output.token = tok;
+
+            output.embd.assign(
+                embd,
+                embd + n_embd
+            );
+
+            ++n_collected;
+
+            SLT_TRC(
+                slot,
+                "Jina collect output: "
+                "pos=%d token=%d type=%s total=%zu\n",
+                output.pos,
+                output.token,
+                output.token == jina_embed_token
+                    ? "embed"
+                    : "rerank",
+                slot.jina_marker_outputs.size()
+            );
+        }
+
+        if (n_collected > 0) {
+            SLT_DBG(
+                slot,
+                "Jina reranker: collected %d marker outputs "
+                "from logical batch, accumulated=%zu\n",
+                n_collected,
+                slot.jina_marker_outputs.size()
+            );
+        }
+    }
+
     void send_rerank(const server_slot & slot, const llama_batch & batch) {
         auto res = std::make_unique<server_task_result_rerank>();
         res->id       = slot.task->id;
         res->index    = slot.task->index;
         res->n_tokens = slot.task->n_tokens();
+
+        if (is_jina_reranker) {
+            const int32_t n_embd = llama_model_n_embd_out(model_tgt);
+
+            std::vector<std::vector<float>> outputs;
+            outputs.reserve(slot.jina_marker_outputs.size());
+
+            for (const auto & marker : slot.jina_marker_outputs) {
+                if (marker.embd.size() != (size_t) n_embd) {
+                    SLT_ERR(
+                        slot,
+                        "Jina reranker: marker at pos=%d "
+                        "has invalid embedding size=%zu, expected=%d\n",
+                        marker.pos,
+                        marker.embd.size(),
+                        n_embd
+                    );
+
+                    send_error(
+                        slot,
+                        "invalid accumulated Jina marker embedding",
+                        ERROR_TYPE_SERVER
+                    );
+
+                    return;
+                }
+
+                SLT_TRC(
+                    slot,
+                    "Jina send output: "
+                    "pos=%d token=%d type=%s\n",
+                    marker.pos,
+                    marker.token,
+                    marker.token == jina_embed_token
+                        ? "embed"
+                        : "rerank"
+                );
+
+                outputs.push_back(marker.embd);
+            }
+
+            if (outputs.size() < 3) {
+                SLT_ERR(
+                    slot,
+                    "Jina reranker: expected at least "
+                    "3 marker outputs, got %zu\n",
+                    outputs.size()
+                );
+
+                send_error(
+                    slot,
+                    "invalid Jina reranker marker output count",
+                    ERROR_TYPE_SERVER
+                );
+
+                return;
+            }
+
+            if (slot.jina_marker_outputs.front().token != jina_rerank_token ||
+                slot.jina_marker_outputs.back().token  != jina_rerank_token) {
+
+                SLT_ERR(
+                    slot,
+                    "%s",
+                    "Jina reranker: expected rerank markers at beginning and end\n"
+                );
+
+                send_error(
+                    slot,
+                    "invalid Jina reranker marker sequence",
+                    ERROR_TYPE_SERVER
+                );
+
+                return;
+            }
+
+            for (size_t i = 1; i + 1 < slot.jina_marker_outputs.size(); ++i) {
+                if (slot.jina_marker_outputs[i].token != jina_embed_token) {
+                    SLT_ERR(
+                        slot,
+                        "Jina reranker: expected embed marker at output %zu, got token=%d\n",
+                        i,
+                        slot.jina_marker_outputs[i].token
+                    );
+
+                    send_error(
+                        slot,
+                        "invalid Jina reranker marker sequence",
+                        ERROR_TYPE_SERVER
+                    );
+
+                    return;
+                }
+            }
+
+            const auto & query_late = outputs.back();
+
+            const size_t n_docs = outputs.size() - 2;
+            // Save Jina-specific block information.
+            // These fields are unused by normal rerankers.
+            res->jina_n_docs = (int32_t) n_docs;
+            res->jina_query_embedding = query_late;
+
+            // Flatten all projected document embeddings into one contiguous vector:
+            //
+            // [D0 values...][D1 values...][D2 values...]...
+            //
+            // Each document has n_embd floats.
+            res->jina_doc_embeddings.reserve(
+                n_docs * (size_t) n_embd
+            );
+
+            // Keep the existing local scores as well.
+            // These are still the final scores for the single-block case.
+            res->scores.reserve(n_docs);
+
+            auto cosine_similarity = [](const std::vector<float> & a,
+                                        const std::vector<float> & b) {
+                GGML_ASSERT(a.size() == b.size());
+
+                double dot = 0.0;
+                double na  = 0.0;
+                double nb  = 0.0;
+
+                for (size_t j = 0; j < a.size(); ++j) {
+                    dot += (double) a[j] * b[j];
+                    na  += (double) a[j] * a[j];
+                    nb  += (double) b[j] * b[j];
+                }
+
+                const double denom =
+                    std::sqrt(na) * std::sqrt(nb) + 1e-8;
+
+                return (float) (dot / denom);
+            };
+
+            // Weight used later if this request contains multiple Jina blocks.
+            float block_weight = 0.0f;
+
+            for (size_t d = 0; d < n_docs; ++d) {
+                const auto & doc = outputs[d + 1];
+
+                // Preserve this document's projected embedding for the later
+                // multi-block fusion/rescoring step.
+                res->jina_doc_embeddings.insert(
+                    res->jina_doc_embeddings.end(),
+                    doc.begin(),
+                    doc.end()
+                );
+
+                // Score against this block's late-query representation.
+                const float score =
+                    cosine_similarity(doc, query_late);
+
+                // Keep local scores. For a single block these remain the
+                // final scores exactly as before.
+                res->scores.push_back(score);
+
+                // Official Jina block weighting:
+                //
+                //     max((1 + cosine_score) / 2)
+                //
+                const float weight =
+                    (1.0f + score) * 0.5f;
+
+                block_weight =
+                    std::max(block_weight, weight);
+            }
+
+            res->jina_block_weight = block_weight;
+
+            SLT_DBG(
+                slot,
+                "Jina block: index=%ld docs=%d weight=%.10f\n",
+                res->index,
+                res->jina_n_docs,
+                res->jina_block_weight
+            );
+
+            SLT_DBG(
+                slot,
+                "Jina reranker: %zu marker outputs, %zu document scores\n",
+                outputs.size(),
+                res->scores.size()
+            );
+
+            for (size_t d = 0; d < res->scores.size(); ++d) {
+                SLT_TRC(
+                    slot,
+                    "Jina reranker: doc %zu score = %.8f\n",
+                    d,
+                    res->scores[d]
+                );
+            }
+            queue_results.send(std::move(res));
+            return;
+        }
 
         for (int i = 0; i < batch.n_tokens; ++i) {
             if (!batch.logits[i] || batch.seq_id[i][0] != slot.id) {
@@ -3138,6 +3585,12 @@ private:
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
 
+                    const bool jina_can_split =
+                            is_jina_reranker &&
+                            slot.task != nullptr &&
+                            slot.task->type == SERVER_TASK_TYPE_RERANK &&
+                            params_base.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
+
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
@@ -3181,7 +3634,7 @@ private:
                             return;
                         }
 
-                        if (!slot.can_split()) {
+                        if (!slot.can_split(jina_can_split)) {
                             if (slot.task->n_tokens() > n_ubatch) {
                                 send_error(slot,
                                            string_format(
@@ -3399,6 +3852,29 @@ private:
                             }
                         }
 
+                        // Jina reranking requires the projected embedding outputs from every
+                        // <|embed_token|> and <|rerank_token|> position.
+                        //
+                        // KV/prompt-cache reuse only preserves the model state; it does not
+                        // preserve the per-token embedding outputs that send_rerank() needs.
+                        //
+                        // Therefore every Jina rerank block must be evaluated from position 0.
+                        if (is_jina_reranker &&
+                            slot.task != nullptr &&
+                            slot.task->type == SERVER_TASK_TYPE_RERANK) {
+
+                            if (n_past > 0) {
+                                SLT_DBG(
+                                    slot,
+                                    "Jina reranker: disabling prompt/KV reuse "
+                                    "(cached %d tokens); re-evaluating full prompt\n",
+                                    n_past
+                                );
+                            }
+
+                            n_past   = 0;
+                        }
+
                         // [TAG_PROMPT_LOGITS]
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
@@ -3425,7 +3901,7 @@ private:
                         }
                     } // end of SLOT_STATE_STARTED
 
-                    if (!slot.can_split()) {
+                    if (!slot.can_split(jina_can_split)) {
                         // cannot fit the prompt in the current batch - will try next iter
                         if (batch.size() + slot.task->n_tokens() > n_batch) {
                             return;
@@ -3539,11 +4015,48 @@ private:
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
-                        add_ok &= batch.add(slot.id,
+                        bool output = slot.need_embd();
+
+                        if (is_jina_reranker &&
+                            slot.task != nullptr &&
+                            slot.task->type == SERVER_TASK_TYPE_RERANK) {
+
+                            // IMPORTANT:
+                            //
+                            // Jina v3.5 uses causal pooling=none embeddings.
+                            //
+                            // When the logical batch is physically split into smaller ubatches,
+                            // requesting embeddings only for the marker tokens produces results
+                            // that differ significantly from llama-embedding.
+                            //
+                            // Match llama-embedding's pooling=none behavior instead: request an
+                            // output for EVERY prompt token. send_rerank() will still discard
+                            // everything except <|embed_token|> and <|rerank_token|>.
+                            output = true;
+
+                            if (cur_tok == jina_embed_token ||
+                                cur_tok == jina_rerank_token) {
+
+                                SLT_TRC(
+                                    slot,
+                                    "Jina marker: pos=%d token=%d type=%s\n",
+                                    slot.prompt.tokens.pos_next(),
+                                    cur_tok,
+                                    cur_tok == jina_embed_token
+                                        ? "embed"
+                                        : "rerank"
+                                );
+                            }
+                        }
+
+                        add_ok &= batch.add(
+                            slot.id,
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
-                            /* output    = */ slot.need_embd(),
-                            /* is_prompt = */ true);
+                            /* output    = */ output,
+                            /* is_prompt = */ true
+                        );
+
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
@@ -3803,10 +4316,26 @@ private:
         };
 
         iterate(slots, [&](server_slot & slot) {
+            // Jina reranking may span several logical llama_decode() calls.
+            //
+            // Collect marker embeddings from every successfully decoded logical
+            // batch before the normal i_batch filtering below. Intermediate prompt
+            // batches may not contain slot.i_batch, but their marker embeddings are
+            // still needed by the final listwise reranker.
+            collect_jina_rerank_outputs(
+                slot,
+                batch_view
+            );
+
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
-                if (slot.task->params.stream && slot.task->params.return_progress) {
-                    send_partial_response(slot, {}, true);
+                if (slot.task->params.stream &&
+                    slot.task->params.return_progress) {
+                    send_partial_response(
+                        slot,
+                        {},
+                        true
+                    );
                 }
             }
 
@@ -5146,8 +5675,21 @@ void server_routes::init_routes() {
 
     this->post_rerank = [this](const server_http_req & req) {
         auto res = create_response();
-        if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
-            res->error(format_error_response("This server does not support reranking. Start it with `--reranking`", ERROR_TYPE_NOT_SUPPORTED));
+        const bool jina_rerank = ctx_server.is_jina_reranker_model();
+
+        const bool rerank_supported =
+            params.embedding &&
+            (
+                (!jina_rerank && params.pooling_type == LLAMA_POOLING_TYPE_RANK) ||
+                ( jina_rerank && params.pooling_type == LLAMA_POOLING_TYPE_NONE)
+            );
+
+        if (!rerank_supported) {
+            res->error(format_error_response(
+                jina_rerank
+                    ? "Jina reranker v3.5 requires embedding mode with pooling=none"
+                    : "This server does not support reranking. Start it with `--reranking`",
+                ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
 
@@ -5182,21 +5724,118 @@ void server_routes::init_routes() {
         // create and queue the task
         json responses = json::array();
         auto & rd = res->rd;
+        server_response_reader::batch_response all_results;
         {
             std::vector<server_task> tasks;
-            tasks.reserve(documents.size());
-            for (size_t i = 0; i < documents.size(); i++) {
-                auto tmp = format_prompt_rerank(ctx_server.model_tgt, ctx_server.vocab, ctx_server.mctx, query, documents[i], ctx_server.init_opt);
-                server_task task = server_task(SERVER_TASK_TYPE_RERANK);
-                task.id     = rd.get_new_id();
-                task.tokens = std::move(tmp);
-                tasks.push_back(std::move(task));
-            }
-            rd.post_tasks(std::move(tasks));
-        }
 
-        // wait for the results
-        auto all_results = rd.wait_for_all(req.should_stop);
+            if (ctx_server.is_jina_reranker_model()) {
+                // Match jina-reranker-v3.5 GGUF reference defaults.
+                constexpr size_t JINA_BLOCK_SIZE             = 125;
+                const     size_t JINA_MAX_LENGTH             = std::min<size_t>(ctx_server.slot_context_size(), 131072);
+                const     size_t JINA_TOKENS_PER_BATCH       = JINA_MAX_LENGTH;
+                constexpr size_t JINA_MODEL_MAX_QUERY_LENGTH = 2048;
+                constexpr size_t JINA_MODEL_MAX_DOC_LENGTH   = 8192;
+                const     size_t JINA_PROMPT_RESERVE         = std::clamp<size_t>(JINA_MAX_LENGTH / 16, 512, 2048);
+                const     size_t JINA_MAX_QUERY_LENGTH       = std::min<size_t>(JINA_MODEL_MAX_QUERY_LENGTH, std::max<size_t>(512, (JINA_MAX_LENGTH * 21) / 100 + 64));
+                const     size_t jina_doc_budget             = JINA_MAX_LENGTH > (2 * JINA_MAX_QUERY_LENGTH + JINA_PROMPT_RESERVE)
+                                                             ? JINA_MAX_LENGTH - 2 * JINA_MAX_QUERY_LENGTH - JINA_PROMPT_RESERVE
+                                                             : 2;
+                const     size_t JINA_MAX_DOC_LENGTH         = std::min<size_t>(JINA_MODEL_MAX_DOC_LENGTH, std::max<size_t>(2, jina_doc_budget));
+
+
+                const auto plan = make_jina_rerank_blocks(
+                    ctx_server.vocab,
+                    query.get<std::string>(),
+                    documents,
+                    JINA_BLOCK_SIZE,
+                    JINA_MAX_LENGTH,
+                    JINA_MAX_QUERY_LENGTH,
+                    JINA_MAX_DOC_LENGTH,
+                    JINA_TOKENS_PER_BATCH
+                );
+
+                SRV_DBG(
+                    "Jina reranker: %zu documents packed into %zu blocks\n",
+                    documents.size(),
+                    plan.blocks.size()
+                );
+
+                all_results.results.reserve(plan.blocks.size());
+
+                for (size_t block_idx = 0; block_idx < plan.blocks.size(); ++block_idx) {
+                    const auto & block_docs = plan.blocks[block_idx];
+
+                    SRV_DBG(
+                        "Jina reranker: block %zu contains %zu documents\n",
+                        block_idx,
+                        block_docs.size()
+                    );
+
+                    auto tmp = format_prompt_rerank_jina(
+                        ctx_server.vocab,
+                        plan.query,
+                        block_docs
+                    );
+
+                    server_task task(SERVER_TASK_TYPE_RERANK);
+
+                    task.id = rd.get_new_id();
+                    task.tokens = std::move(tmp);
+
+                    // Each response reader may only be submitted once.
+                    // Create one reader per Jina block so sibling blocks execute
+                    // strictly sequentially.
+                    server_response_reader block_rd(
+                        rd.queue_tasks,
+                        rd.queue_results,
+                        rd.polling_interval_seconds
+                    );
+
+                    block_rd.post_task(std::move(task));
+
+                    auto result = block_rd.next(req.should_stop);
+
+                    if (!result) {
+                        all_results.is_terminated = true;
+                        break;
+                    }
+
+                    if (result->is_error()) {
+                        all_results.error = std::move(result);
+                        break;
+                    }
+
+                    // post_task() assigns index 0 because this reader owns one task.
+                    // Restore the Jina logical block index for the fusion code.
+                    result->index = block_idx;
+
+                    all_results.results.push_back(std::move(result));
+                }
+            } else {
+                // Existing llama.cpp pairwise reranker behavior.
+                tasks.reserve(documents.size());
+
+                for (size_t i = 0; i < documents.size(); i++) {
+                    auto tmp = format_prompt_rerank(
+                        ctx_server.model_tgt,
+                        ctx_server.vocab,
+                        ctx_server.mctx,
+                        query,
+                        documents[i],
+                        ctx_server.init_opt
+                    );
+
+                    server_task task(SERVER_TASK_TYPE_RERANK);
+                    task.id     = rd.get_new_id();
+                    task.tokens = std::move(tmp);
+
+                    tasks.push_back(std::move(task));
+                }
+
+                rd.post_tasks(std::move(tasks));
+                all_results = rd.wait_for_all(req.should_stop);
+            }
+        }
 
         // collect results
         if (all_results.is_terminated) {
@@ -5205,9 +5844,239 @@ void server_routes::init_routes() {
             res->error(all_results.error->to_json());
             return res;
         } else {
-            for (auto & res : all_results.results) {
-                GGML_ASSERT(dynamic_cast<server_task_result_rerank*>(res.get()) != nullptr);
-                responses.push_back(res->to_json());
+            if (ctx_server.is_jina_reranker_model()) {
+                // Jina may return multiple task results now:
+                //
+                //   block 0 -> docs   0..124
+                //   block 1 -> docs 125..249
+                //   ...
+                //
+                // Collect and restore them to their original block order first.
+                std::vector<server_task_result_rerank *> blocks;
+                blocks.reserve(all_results.results.size());
+
+                for (auto & result : all_results.results) {
+                    auto * rerank_res =
+                        dynamic_cast<server_task_result_rerank *>(
+                            result.get()
+                        );
+
+                    GGML_ASSERT(rerank_res != nullptr);
+
+                    blocks.push_back(rerank_res);
+                }
+
+                std::sort(
+                    blocks.begin(),
+                    blocks.end(),
+                    [](const auto * a, const auto * b) {
+                        return a->index < b->index;
+                    }
+                );
+
+                if (blocks.empty()) {
+                    res->error(format_error_response(
+                        "Jina reranker returned no block results",
+                        ERROR_TYPE_SERVER
+                    ));
+                    return res;
+                }
+
+                // ---------------------------------------------------------------------
+                // Single-block fast path
+                //
+                // No fusion is necessary. Use the already-computed local scores exactly
+                // as before. This preserves our validated <= 125 document behavior.
+                // ---------------------------------------------------------------------
+
+                if (blocks.size() == 1) {
+                    const auto * block = blocks[0];
+
+                    if (block->scores.size() != documents.size()) {
+                        res->error(format_error_response(
+                            string_format(
+                                "Jina reranker returned %zu scores for %zu documents",
+                                block->scores.size(),
+                                documents.size()
+                            ),
+                            ERROR_TYPE_SERVER
+                        ));
+                        return res;
+                    }
+
+                    for (size_t i = 0; i < block->scores.size(); ++i) {
+                        responses.push_back(json {
+                            {"index", i},
+                            {"score", block->scores[i]},
+                            {"tokens_evaluated", i == 0 ? block->n_tokens : 0},
+                        });
+                    }
+
+                // ---------------------------------------------------------------------
+                // Multi-block path
+                //
+                // 1. Fuse the late-query representation from each block.
+                // 2. Rescore every stored document embedding against that fused query.
+                // ---------------------------------------------------------------------
+
+                } else {
+                    const int32_t n_embd =
+                        llama_model_n_embd_out(ctx_server.model_tgt);
+
+                    // Use double for the fused query accumulator.
+                    // The individual model embeddings remain float.
+                    std::vector<double> query_fused(
+                        (size_t) n_embd,
+                        0.0
+                    );
+
+                    double weight_sum = 0.0;
+
+                    // -----------------------------------------------------------------
+                    // Weighted query fusion
+                    // -----------------------------------------------------------------
+
+                    for (const auto * block : blocks) {
+                        if (block->jina_query_embedding.size() != (size_t) n_embd) {
+                            res->error(format_error_response(
+                                string_format(
+                                    "Jina reranker returned query embedding size %zu, expected %d",
+                                    block->jina_query_embedding.size(),
+                                    n_embd
+                                ),
+                                ERROR_TYPE_SERVER
+                            ));
+                            return res;
+                        }
+
+                        const double weight =
+                            (double) block->jina_block_weight;
+
+                        weight_sum += weight;
+
+                        for (int32_t j = 0; j < n_embd; ++j) {
+                            query_fused[j] +=
+                                weight *
+                                (double) block->jina_query_embedding[j];
+                        }
+                    }
+
+                    if (weight_sum <= 0.0) {
+                        res->error(format_error_response(
+                            "Jina reranker produced zero total block weight",
+                            ERROR_TYPE_SERVER
+                        ));
+                        return res;
+                    }
+
+                    for (double & value : query_fused) {
+                        value /= weight_sum;
+                    }
+
+                    // -----------------------------------------------------------------
+                    // Token accounting
+                    //
+                    // Each block is a real independent prompt, so usage is the sum of
+                    // all block prompt lengths.
+                    // -----------------------------------------------------------------
+
+                    int32_t total_prompt_tokens = 0;
+
+                    for (const auto * block : blocks) {
+                        total_prompt_tokens += block->n_tokens;
+                    }
+
+                    // -----------------------------------------------------------------
+                    // Rescore every document against the fused query.
+                    //
+                    // Blocks are sorted above, so walking them sequentially reconstructs
+                    // the original document indices.
+                    // -----------------------------------------------------------------
+
+                    size_t global_doc_index = 0;
+
+                    for (const auto * block : blocks) {
+                        const size_t expected_size =
+                            (size_t) block->jina_n_docs *
+                            (size_t) n_embd;
+
+                        if (block->jina_doc_embeddings.size() != expected_size) {
+                            res->error(format_error_response(
+                                string_format(
+                                    "Jina reranker returned %zu document embedding values, expected %zu",
+                                    block->jina_doc_embeddings.size(),
+                                    expected_size
+                                ),
+                                ERROR_TYPE_SERVER
+                            ));
+                            return res;
+                        }
+
+                        for (int32_t d = 0;
+                            d < block->jina_n_docs;
+                            ++d) {
+
+                            const float * doc =
+                                block->jina_doc_embeddings.data()
+                                + (size_t) d * (size_t) n_embd;
+
+                            double dot = 0.0;
+                            double nd  = 0.0;
+                            double nq  = 0.0;
+
+                            for (int32_t j = 0; j < n_embd; ++j) {
+                                const double dv = (double) doc[j];
+                                const double qv = (double) query_fused[j];
+
+                                dot += dv * qv;
+                                nd  += dv * dv;
+                                nq  += qv * qv;
+                            }
+
+                            const double denom =
+                                std::sqrt(nd) *
+                                std::sqrt(nq) +
+                                1e-8;
+
+                            const float score =
+                                (float) (dot / denom);
+
+                            responses.push_back(json {
+                                {"index", global_doc_index},
+                                {"score", score},
+                                {"tokens_evaluated",
+                                    global_doc_index == 0
+                                        ? total_prompt_tokens
+                                        : 0},
+                            });
+
+                            ++global_doc_index;
+                        }
+                    }
+
+                    if (global_doc_index != documents.size()) {
+                        res->error(format_error_response(
+                            string_format(
+                                "Jina reranker produced %zu document scores for %zu documents",
+                                global_doc_index,
+                                documents.size()
+                            ),
+                            ERROR_TYPE_SERVER
+                        ));
+                        return res;
+                    }
+                }
+
+            } else {
+                // Existing llama.cpp reranker behavior remains completely unchanged.
+                for (auto & result : all_results.results) {
+                    GGML_ASSERT(
+                        dynamic_cast<server_task_result_rerank *>(
+                            result.get()) != nullptr
+                    );
+
+                    responses.push_back(result->to_json());
+                }
             }
         }
 
