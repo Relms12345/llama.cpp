@@ -467,7 +467,19 @@ struct server_task_result_embd : server_task_result {
 };
 
 struct server_task_result_rerank : server_task_result {
+    // Existing generic reranker score.
+    // Keep this unchanged for all normal pairwise rerankers.
     float score = -1e6;
+
+    // Jina-specific listwise data.
+    // These remain empty/default for every other reranker.
+    std::vector<float> scores;
+
+    std::vector<float> jina_doc_embeddings;
+    std::vector<float> jina_query_embedding;
+
+    float jina_block_weight = 0.0f;
+    int32_t jina_n_docs = 0;
 
     int32_t n_tokens;
 
