@@ -1667,8 +1667,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool    dflash_embd = model.arch == LLM_ARCH_DFLASH && batch_inp.embd;
     const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : dflash_embd ? hparams.n_embd_inp_enc() : hparams.n_embd_inp();
 
-    // when computing embeddings, all tokens are output
-    const bool output_all   = cparams.embeddings;
+    // Pooled embeddings require every token to be an output.
+    //
+    // With pooling=none, honor an explicit batch.logits mask. This allows
+    // callers such as the Jina reranker to request embeddings only for
+    // selected marker tokens.
+    //
+    // If pooling=none and no mask was supplied, preserve the traditional
+    // behavior and output every token.
+    const bool output_all =
+        cparams.embeddings &&
+        (
+            cparams.pooling_type != LLAMA_POOLING_TYPE_NONE ||
+            batch_inp.logits == nullptr
+        );
     const bool has_samplers = !sampling.samplers.empty();
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;

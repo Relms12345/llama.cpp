@@ -279,6 +279,11 @@ server_tokens process_mtmd_prompt(
                                         const mtmd_helper_init_opt & init_opt,
                                         bool is_placeholder = false);
 
+server_tokens format_prompt_rerank_jina(
+        const struct llama_vocab * vocab,
+        const std::string & query,
+        const std::vector<std::string> & documents);
+
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
  * this supports these cases:

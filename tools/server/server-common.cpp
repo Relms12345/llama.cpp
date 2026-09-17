@@ -969,6 +969,93 @@ server_tokens process_mtmd_prompt(
     return result;
 }
 
+static std::string sanitize_jina_rerank_text(std::string text) {
+    string_replace_all(text, "<|embed_token|>", "");
+    string_replace_all(text, "<|rerank_token|>", "");
+    string_replace_all(text, "<|score_token|>", "");
+    return text;
+}
+
+server_tokens format_prompt_rerank_jina(
+        const llama_vocab * vocab,
+        const std::string & query_in,
+        const std::vector<std::string> & documents_in) {
+
+    const std::string query = sanitize_jina_rerank_text(query_in);
+
+    std::vector<std::string> documents;
+    documents.reserve(documents_in.size());
+
+    for (const auto & doc : documents_in) {
+        documents.push_back(sanitize_jina_rerank_text(doc));
+    }
+
+    std::string prompt;
+
+    prompt += "<|im_start|>system\n";
+    prompt +=
+        "You are a search relevance expert who can determine a ranking of the passages "
+        "based on how relevant they are to the query. "
+        "If the query is a question, how relevant a passage is depends on how well it "
+        "answers the question. "
+        "If not, try to analyze the intent of the query and assess how well each passage "
+        "satisfies the intent. "
+        "If an instruction is provided, you should follow the instruction when determining "
+        "the ranking.";
+    prompt += "<|im_end|>\n";
+    prompt += "<|im_start|>user\n";
+
+    prompt += "I will provide you with ";
+    prompt += std::to_string(documents.size());
+    prompt +=
+        " passages, each indicated by a numerical identifier. "
+        "Rank the passages based on their relevance to query: ";
+    prompt += query;
+
+    // Early query representation for dual matching.
+    prompt += "<|rerank_token|>\n";
+
+    for (size_t i = 0; i < documents.size(); ++i) {
+        prompt += "<passage id=\"";
+        prompt += std::to_string(i);
+        prompt += "\">\n";
+
+        prompt += documents[i];
+        prompt += "<|embed_token|>\n";
+
+        prompt += "</passage>\n";
+    }
+
+    // Late query representation -- this is the one we'll score against.
+    prompt += "<query>\n";
+    prompt += query;
+    prompt += "<|rerank_token|>\n";
+    prompt += "</query>";
+
+    prompt +=
+        "\nPlease provide the ranking of all passages based on their relevance "
+        "to the search query, in descending order of relevance, with each label "
+        "enclosed in square brackets (e.g., [2] > [1] > [3] > [0]).";
+
+    prompt += "<|im_end|>\n";
+    prompt += "<|im_start|>assistant\n";
+    prompt += "<think>\n\n</think>\n\n";
+
+    const auto tokens = common_tokenize(
+        vocab,
+        prompt,
+        false,
+        true
+    );
+
+    server_tokens result;
+    for (const auto token : tokens) {
+        result.push_back(token);
+    }
+
+    return result;
+}
+
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
  * use tokenize_input_prompts() if the input could be an array.
