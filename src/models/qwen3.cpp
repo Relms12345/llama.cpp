@@ -43,6 +43,21 @@ void llama_model_qwen3::load_arch_tensors(llama_model_loader &) {
     // output rerank head
     cls_out = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), {n_embd, hparams.n_cls_out}, TENSOR_NOT_REQUIRED);
 
+    // jina-reranker-v3.5 projector
+    rerank_proj_0 = create_tensor(tn(LLM_TENSOR_RERANK_PROJ_0, "weight"), {n_embd, 512}, TENSOR_NOT_REQUIRED);
+    rerank_proj_2 = create_tensor(tn(LLM_TENSOR_RERANK_PROJ_2, "weight"), {512, 512}, TENSOR_NOT_REQUIRED);
+
+    // If the Jina projector is present, t_embd is the projector output rather
+    // than the Qwen3 hidden state. Keep llama_model_n_embd_out() in sync with
+    // the actual graph output so embedding buffers and server-side copies use
+    // the correct width.
+    if ((rerank_proj_0 == nullptr) != (rerank_proj_2 == nullptr)) {
+        throw std::runtime_error("incomplete Jina reranker projector: expected both rerank.projector.0 and rerank.projector.2");
+    }
+    if (rerank_proj_2 != nullptr) {
+        hparams.n_embd_out_impl = (uint32_t) rerank_proj_2->ne[1];
+    }
+
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
 
@@ -173,6 +188,21 @@ llama_model_qwen3::graph<iswa>::graph(const llama_model & model, const llm_graph
             LLM_NORM_RMS, -1);
 
     cb(cur, "result_norm", -1);
+
+    if (cparams.embeddings &&
+        pooling_type == LLAMA_POOLING_TYPE_NONE &&
+        model.rerank_proj_0 != nullptr &&
+        model.rerank_proj_2 != nullptr) {
+        cur = build_lora_mm(model.rerank_proj_0, cur, nullptr);
+        cb(cur, "rerank_proj_0", -1);
+
+        cur = ggml_relu(ctx0, cur);
+        cb(cur, "rerank_relu", -1);
+
+        cur = build_lora_mm(model.rerank_proj_2, cur, nullptr);
+        cb(cur, "rerank_proj_2", -1);
+    }
+
     res->t_embd = cur;
 
     // skip lm_head in embedding mode with pooling=none (logit tensor is too large for long-context)

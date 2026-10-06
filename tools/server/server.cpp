@@ -160,9 +160,16 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         // embeddings require all tokens to be processed in a single ubatch
         // see https://github.com/ggml-org/llama.cpp/issues/12836
         if (params.embedding && params.n_batch > params.n_ubatch) {
-            SRV_WRN("embeddings enabled with n_batch (%d) > n_ubatch (%d)\n", params.n_batch, params.n_ubatch);
-            SRV_WRN("setting n_batch = n_ubatch = %d to avoid assertion failure\n", params.n_ubatch);
-            params.n_batch = params.n_ubatch;
+            if (params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL) {
+                SRV_INF(
+                    "causal embeddings enabled with n_batch (%d) > n_ubatch (%d); allowing physical microbatching\n",
+                    params.n_batch,
+                    params.n_ubatch);
+            } else {
+                SRV_WRN("embeddings enabled with n_batch (%d) > n_ubatch (%d)\n", params.n_batch, params.n_ubatch);
+                SRV_WRN("setting n_batch = n_ubatch = %d to avoid assertion failure\n", params.n_ubatch);
+                params.n_batch = params.n_ubatch;
+            }
         }
 
         if (params.n_parallel < 0) {
