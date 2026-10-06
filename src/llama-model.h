@@ -686,6 +686,10 @@ struct llama_model {
     struct ggml_tensor * cls_norm  = nullptr;
     struct ggml_tensor * cls_norm_b = nullptr;
 
+    // jina-reranker-v3.5 projected listwise embeddings
+    struct ggml_tensor * rerank_proj_0 = nullptr;
+    struct ggml_tensor * rerank_proj_2 = nullptr;
+
     struct ggml_tensor * conv1d   = nullptr;
     struct ggml_tensor * conv1d_b = nullptr;
 

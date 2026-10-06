@@ -299,6 +299,27 @@ server_tokens process_mtmd_prompt(
                                         const mtmd_helper_init_opt & init_opt,
                                         bool is_placeholder = false);
 
+server_tokens format_prompt_rerank_jina(
+        const struct llama_vocab * vocab,
+        const std::string & query,
+        const std::vector<std::string> & documents);
+
+struct jina_rerank_block_plan {
+    std::string query;
+    std::vector<std::string> documents;
+    std::vector<std::vector<std::string>> blocks;
+};
+
+jina_rerank_block_plan make_jina_rerank_blocks(
+        const struct llama_vocab * vocab,
+        const std::string & query,
+        const std::vector<std::string> & documents,
+        size_t block_size       = 125,
+        size_t max_length       = 131072,
+        size_t max_query_length = 2048,
+        size_t max_doc_length   = 8192,
+        size_t tokens_per_batch = 131072);
+
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
  * this supports these cases:
