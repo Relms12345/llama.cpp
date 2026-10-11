@@ -278,6 +278,13 @@ class JinaRerankerModel(Qwen3Model):
     def _is_qwen3_reranker(self) -> bool:
         return False
 
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        # TextModel drops "projector." tensors as multimodal; here they are the rerank head
+        if item[0].startswith("projector."):
+            return item
+        return super().filter_tensors(item)
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self.gguf_writer.add_pooling_type(gguf.PoolingType.NONE)
