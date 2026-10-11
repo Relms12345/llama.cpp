@@ -114,7 +114,22 @@ def build_cases() -> list[dict]:
             "The deep ocean is cold and dark.",
         ],
     })
+
+    # about 24k tokens: one block at -c 131072 (like the reference), several blocks at small -c
+    topics = ["coral reefs", "railway history", "quantum computing", "olive oil", "glaciers", "chess openings"]
+    docs = []
+    for i in range(60):
+        t = topics[i % len(topics)]
+        docs.append(f"Report {i} on {t}. " + f"This paragraph describes {t} and related facts in some depth. " * 30)
+    cases.append({"name": "split_small_ctx", "query": "how do glaciers move?", "documents": docs})
     return cases
+
+
+def select_cases(cases: list[dict], names: str | None) -> list[dict]:
+    if not names:
+        return cases
+    wanted = names.split(",")
+    return [c for c in cases if c["name"] in wanted]
 
 
 def normalize_results(results, n_docs: int) -> list[float]:
@@ -137,13 +152,13 @@ def dump_hf(args) -> None:
     from transformers import AutoModel
 
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
-    model = AutoModel.from_pretrained(args.model, trust_remote_code=True, torch_dtype=dtype)
+    model = AutoModel.from_pretrained(args.model, trust_remote_code=True, dtype=dtype)
     model.to(args.device).eval()
     if not hasattr(model, "rerank"):
         sys.exit("model has no rerank() method; check the model card for the reference API")
 
     out = {"model": args.model, "dtype": args.dtype, "cases": []}
-    for case in build_cases():
+    for case in select_cases(build_cases(), args.cases):
         with torch.no_grad():
             results = model.rerank(case["query"], case["documents"], top_n=len(case["documents"]))
         case = dict(case, ref_scores=normalize_results(results, len(case["documents"])))
@@ -191,8 +206,13 @@ def topk(xs: list[float], k: int) -> list[int]:
 
 
 def compare(args) -> None:
-    with open(args.ref) as f:
-        ref = json.load(f)
+    ref = {"cases": []}
+    for path in args.ref:
+        with open(path) as f:
+            r = json.load(f)
+        ref.update({k: v for k, v in r.items() if k != "cases"})
+        ref["cases"] += r["cases"]
+    ref["cases"] = select_cases(ref["cases"], args.cases)
 
     failed = False
     print(f"reference: {ref.get('model')} ({ref.get('dtype')})\n")
@@ -226,12 +246,14 @@ def main() -> None:
     d.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     d.add_argument("--device", default="cuda" if _has_cuda() else "cpu")
     d.add_argument("--out", default="ref.json")
+    d.add_argument("--cases", help="comma-separated case names (default: all)")
     d.set_defaults(func=dump_hf)
 
     c = sub.add_parser("compare", help="compare llama-server against reference scores")
-    c.add_argument("--ref", default="ref.json")
+    c.add_argument("--ref", nargs="+", default=["ref.json"], help="one or more dump-hf outputs")
+    c.add_argument("--cases", help="comma-separated case names (default: all)")
     c.add_argument("--server", default="http://127.0.0.1:8080")
-    c.add_argument("--max-abs", type=float, default=0.05, help="max allowed |score diff| (Q8_0 vs bf16)")
+    c.add_argument("--max-abs", type=float, default=0.01, help="max allowed |score diff| (Q8_0 vs fp32 is about 0.006)")
     c.add_argument("--min-spearman", type=float, default=0.98)
     c.add_argument("-v", "--verbose", action="store_true")
     c.set_defaults(func=compare)

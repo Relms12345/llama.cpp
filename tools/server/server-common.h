@@ -299,26 +299,25 @@ server_tokens process_mtmd_prompt(
                                         const mtmd_helper_init_opt & init_opt,
                                         bool is_placeholder = false);
 
-server_tokens format_prompt_rerank_jina(
-        const struct llama_vocab * vocab,
-        const std::string & query,
-        const std::vector<std::string> & documents);
-
-struct jina_rerank_block_plan {
-    std::string query;
-    std::vector<std::string> documents;
-    std::vector<std::vector<std::string>> blocks;
+struct jina_rerank_block {
+    size_t begin;                    // first document index
+    size_t end;                      // one past the last document index
+    std::vector<llama_token> tokens; // formatted block prompt
 };
 
+struct jina_rerank_block_plan {
+    std::string query;                  // sanitized and truncated
+    std::vector<std::string> documents; // sanitized and truncated
+    std::vector<jina_rerank_block> blocks;
+};
+
+// split documents into blocks like the HF reference (125 docs, 131072 tokens), and
+// further where a block would not fit in n_ctx; throws std::invalid_argument on bad input
 jina_rerank_block_plan make_jina_rerank_blocks(
         const struct llama_vocab * vocab,
         const std::string & query,
         const std::vector<std::string> & documents,
-        size_t block_size       = 125,
-        size_t max_length       = 131072,
-        size_t max_query_length = 2048,
-        size_t max_doc_length   = 8192,
-        size_t tokens_per_batch = 131072);
+        size_t n_ctx);
 
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them

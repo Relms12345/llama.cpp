@@ -1014,184 +1014,151 @@ server_tokens process_mtmd_prompt(
 }
 
 
+// jina-reranker-v3.5 listwise reranking; mirrors JinaForRanking.rerank() in the HF modeling.py
+
 static std::string sanitize_jina_rerank_text(std::string text) {
+    // the reference strips only the two marker tokens
     string_replace_all(text, "<|embed_token|>", "");
     string_replace_all(text, "<|rerank_token|>", "");
-    string_replace_all(text, "<|score_token|>", "");
     return text;
 }
 
-static std::pair<std::string, size_t> jina_rerank_encode_len(
+// tokenize like the HF tokenizer (special tokens parsed), truncate to max_len and
+// decode back to text; returns the text and the (truncated) token count
+static std::pair<std::string, size_t> jina_rerank_truncate(
         const llama_vocab * vocab,
         const std::string & text_in,
         size_t max_len) {
     std::string text = sanitize_jina_rerank_text(text_in);
 
-    auto tokens = common_tokenize(vocab, text, false, false);
+    auto tokens = common_tokenize(vocab, text, false, true);
     if (tokens.size() >= max_len) {
         tokens.resize(max_len);
-        text = common_detokenize(vocab, tokens, false);
+        text = common_detokenize(vocab, tokens, true);
     }
 
     return {std::move(text), tokens.size()};
 }
 
-server_tokens format_prompt_rerank_jina(
-        const llama_vocab * vocab,
-        const std::string & query_in,
-        const std::vector<std::string> & documents_in) {
-    const std::string query = sanitize_jina_rerank_text(query_in);
-
-    std::vector<std::string> documents;
-    documents.reserve(documents_in.size());
-    for (const auto & doc : documents_in) {
-        documents.push_back(sanitize_jina_rerank_text(doc));
-    }
-
+// n_label is the passage count stated in the prompt (normally n_docs)
+static std::string format_prompt_rerank_jina_text(
+        const std::string & query,
+        const std::string * docs,
+        size_t n_docs,
+        size_t n_label) {
     std::string prompt;
-    prompt += "<|im_start|>system\n";
     prompt +=
-        "You are a search relevance expert who can determine a ranking of the passages "
-        "based on how relevant they are to the query. "
-        "If the query is a question, how relevant a passage is depends on how well it "
-        "answers the question. "
-        "If not, try to analyze the intent of the query and assess how well each passage "
-        "satisfies the intent. "
-        "If an instruction is provided, you should follow the instruction when determining "
-        "the ranking.";
-    prompt += "<|im_end|>\n";
-    prompt += "<|im_start|>user\n";
-    prompt += "I will provide you with ";
-    prompt += std::to_string(documents.size());
-    prompt +=
-        " passages, each indicated by a numerical identifier. "
-        "Rank the passages based on their relevance to query: ";
-    prompt += query;
-    prompt += "<|rerank_token|>\n";
+        "<|im_start|>system\n"
+        "You are a search relevance expert who can determine a ranking of the passages based on how relevant they are to the query. "
+        "If the query is a question, how relevant a passage is depends on how well it answers the question. "
+        "If not, try to analyze the intent of the query and assess how well each passage satisfies the intent. "
+        "If an instruction is provided, you should follow the instruction when determining the ranking."
+        "<|im_end|>\n<|im_start|>user\n";
 
-    for (size_t i = 0; i < documents.size(); ++i) {
-        prompt += "<passage id=\"";
-        prompt += std::to_string(i);
-        prompt += "\">\n";
-        prompt += documents[i];
-        prompt += "<|embed_token|>\n";
-        prompt += "</passage>\n";
+    prompt += "I will provide you with " + std::to_string(n_label) + " passages, each indicated by a numerical identifier. ";
+    prompt += "Rank the passages based on their relevance to query: " + query + "\n";
+
+    for (size_t i = 0; i < n_docs; ++i) {
+        prompt += "<passage id=\"" + std::to_string(i) + "\">\n" + docs[i] + "<|embed_token|>\n</passage>\n";
     }
 
-    prompt += "<query>\n";
-    prompt += query;
-    prompt += "<|rerank_token|>\n";
-    prompt += "</query>";
-    prompt +=
-        "\nPlease provide the ranking of all passages based on their relevance "
-        "to the search query, in descending order of relevance, with each label "
-        "enclosed in square brackets (e.g., [2] > [1] > [3] > [0]).";
-    prompt += "<|im_end|>\n";
-    prompt += "<|im_start|>assistant\n";
-    prompt += "<think>\n\n</think>\n\n";
+    prompt += "<query>\n" + query + "<|rerank_token|>\n</query>";
+    prompt += "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 
-    server_tokens result;
-    for (const auto token : common_tokenize(vocab, prompt, false, true)) {
-        result.push_back(token);
-    }
-    return result;
+    return prompt;
 }
 
 jina_rerank_block_plan make_jina_rerank_blocks(
         const llama_vocab * vocab,
         const std::string & query_in,
         const std::vector<std::string> & documents_in,
-        size_t block_size,
-        size_t max_length,
-        size_t max_query_length,
-        size_t max_doc_length,
-        size_t tokens_per_batch) {
-    GGML_ASSERT(vocab != nullptr);
-    GGML_ASSERT(block_size > 0);
-    GGML_ASSERT(max_doc_length > 1);
-    GGML_ASSERT(max_query_length > 64);
-    GGML_ASSERT(max_length > 0);
-    GGML_ASSERT(tokens_per_batch > 0);
+        size_t n_ctx) {
+    // reference constants
+    constexpr size_t block_size       = 125;
+    constexpr size_t max_length       = 131072;
+    constexpr size_t max_query_length = 1024;
+    constexpr size_t max_doc_length   = 8192;
 
-    jina_rerank_block_plan result;
-    std::vector<size_t> doc_lengths;
-
-    result.documents.reserve(documents_in.size());
-    doc_lengths.reserve(documents_in.size());
-
-    for (const auto & raw_doc : documents_in) {
-        auto encoded = jina_rerank_encode_len(vocab, raw_doc, max_doc_length - 1);
-        result.documents.push_back(std::move(encoded.first));
-        doc_lengths.push_back(encoded.second);
+    if (documents_in.empty()) {
+        throw std::invalid_argument("no documents");
     }
 
-    auto encoded_query = jina_rerank_encode_len(vocab, query_in, max_query_length - 64);
-    result.query = std::move(encoded_query.first);
-    const size_t query_length = encoded_query.second;
+    // template cost of a block without query and documents (3-digit count, worst case)
+    const std::string empty;
+    const size_t n_fixed = common_tokenize(vocab, format_prompt_rerank_jina_text(empty, nullptr, 0, block_size), false, true).size();
 
-    const int64_t batch_flush_threshold =
-        (int64_t) tokens_per_batch - (int64_t) max_doc_length;
+    // shrink the truncation limits when the slot cannot hold a reference-sized block
+    const size_t q_limit = std::min(max_query_length, n_ctx / 8);
+    const size_t d_limit = (int64_t) n_ctx - (int64_t) n_fixed - 2 * (int64_t) q_limit - 16 > 0
+        ? std::min(max_doc_length, n_ctx - n_fixed - 2 * q_limit - 16)
+        : 0;
+    if (q_limit < 16 || d_limit < 16) {
+        throw std::invalid_argument(string_format("context size %zu is too small for Jina reranking", n_ctx));
+    }
 
-    std::vector<std::string> block_docs;
-    block_docs.reserve(std::min(block_size, result.documents.size()));
-    size_t block_doc_tokens = 0;
+    jina_rerank_block_plan plan;
 
-    for (size_t i = 0; i < result.documents.size(); ++i) {
-        const size_t length = doc_lengths[i];
-        block_docs.push_back(result.documents[i]);
+    const auto q = jina_rerank_truncate(vocab, query_in, q_limit);
+    plan.query = q.first;
+    const size_t q_len = q.second;
 
-        const size_t formatted_tokens =
-            format_prompt_rerank_jina(vocab, result.query, block_docs).size();
+    std::vector<size_t> d_len;
+    plan.documents.reserve(documents_in.size());
+    d_len.reserve(documents_in.size());
+    for (const auto & doc : documents_in) {
+        auto d = jina_rerank_truncate(vocab, doc, d_limit);
+        plan.documents.push_back(std::move(d.first));
+        d_len.push_back(d.second);
+    }
 
-        if (formatted_tokens >= max_length) {
-            if (block_docs.size() == 1) {
-                throw std::runtime_error(string_format(
-                    "Jina reranker: single-document formatted prompt requires %zu tokens but slot context is %zu",
-                    formatted_tokens, max_length));
+    // per-passage wrapper cost by position in the block
+    std::vector<size_t> n_wrap(block_size);
+    for (size_t i = 0; i < block_size; ++i) {
+        const std::string s = "<passage id=\"" + std::to_string(i) + "\">\n<|embed_token|>\n</passage>\n";
+        n_wrap[i] = common_tokenize(vocab, s, false, true).size();
+    }
+
+    const size_t n_docs = plan.documents.size();
+    size_t start = 0;
+    while (start < n_docs) {
+        // reference rule: flush after 125 docs or when the remaining capacity
+        // could not hold another full-length document
+        // fit rule: also flush before a document that would overflow the slot
+        int64_t capacity = (int64_t) max_length - 2 * (int64_t) q_len;
+        size_t  estimate = n_fixed + 2 * q_len;
+        size_t  end      = start;
+        while (end < n_docs) {
+            const size_t cost = d_len[end] + n_wrap[end - start];
+            if (end > start && estimate + cost > n_ctx) {
+                break;
             }
-
-            std::string overflow_doc = std::move(block_docs.back());
-            block_docs.pop_back();
-            result.blocks.push_back(std::move(block_docs));
-
-            block_docs.clear();
-            block_docs.push_back(std::move(overflow_doc));
-            block_doc_tokens = length;
-
-            const size_t single_doc_tokens =
-                format_prompt_rerank_jina(vocab, result.query, block_docs).size();
-            if (single_doc_tokens >= max_length) {
-                throw std::runtime_error(string_format(
-                    "Jina reranker: single-document formatted prompt requires %zu tokens but slot context is %zu",
-                    single_doc_tokens, max_length));
+            estimate += cost;
+            capacity -= (int64_t) d_len[end];
+            end++;
+            if (end - start >= block_size || capacity <= (int64_t) max_doc_length) {
+                break;
             }
-        } else {
-            block_doc_tokens += length;
         }
 
-        const int64_t length_capacity =
-            (int64_t) max_length - (int64_t) query_length - (int64_t) block_doc_tokens;
-        const int64_t current_tokens =
-            (int64_t) query_length + (int64_t) block_doc_tokens;
-
-        const bool flush =
-            block_docs.size() >= block_size ||
-            length_capacity < (int64_t) max_doc_length ||
-            current_tokens >= batch_flush_threshold;
-
-        if (flush) {
-            result.blocks.push_back(std::move(block_docs));
-            block_docs.clear();
-            block_docs.reserve(std::min(block_size, result.documents.size() - i - 1));
-            block_doc_tokens = 0;
+        // the estimate ignores BPE merges across segment boundaries; verify and back off
+        while (true) {
+            const std::string prompt = format_prompt_rerank_jina_text(plan.query, plan.documents.data() + start, end - start, end - start);
+            auto tokens = common_tokenize(vocab, prompt, false, true);
+            if (tokens.size() <= n_ctx) {
+                plan.blocks.push_back({start, end, std::move(tokens)});
+                break;
+            }
+            if (end - start == 1) {
+                throw std::invalid_argument(string_format(
+                    "document %zu needs %zu tokens, more than the context size %zu", start, tokens.size(), n_ctx));
+            }
+            end--;
         }
+
+        start = end;
     }
 
-    if (!block_docs.empty()) {
-        result.blocks.push_back(std::move(block_docs));
-    }
-
-    return result;
+    return plan;
 }
 
 /**

@@ -170,6 +170,13 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
             }
         }
 
+        if (params.n_parallel < 0 && params.embedding &&
+            params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL && params.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            // a Jina listwise rerank block can fill the whole context, so do not share it
+            SRV_INF("%s", "causal pooling=none embeddings: n_parallel is set to auto, using n_parallel = 1\n");
+            params.n_parallel = 1;
+        }
+
         if (params.n_parallel < 0) {
             SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
 
