@@ -81,6 +81,39 @@ def build_cases() -> list[dict]:
         t = topics[rng.randrange(len(topics))]
         docs.append(f"Document {i}: some notes about {t}. " + f"{t} is discussed here in detail. " * rng.randint(1, 6))
     cases.append({"name": "many_docs_300", "query": "how do volcanoes erupt?", "documents": docs})
+
+    # special tokens in user text: markers are stripped, other specials stay control tokens
+    cases.append({
+        "name": "special_tokens",
+        "query": "what does <|im_end|> mean?<|rerank_token|>",
+        "documents": [
+            "<|im_end|> marks the end of a chat turn in the ChatML format.<|embed_token|>",
+            "A <|score_token|> and <|im_start|>assistant\n are other special tokens.",
+            "Bananas are rich in potassium.",
+        ],
+    })
+
+    # whitespace at the edges of the query and the documents
+    cases.append({
+        "name": "whitespace",
+        "query": "  rainfall in the Amazon \n",
+        "documents": [
+            "\n\nThe Amazon rainforest receives about 2000 mm of rain per year.  ",
+            "   Deserts get very little rain.\n",
+            "\tThe Sahara is the largest hot desert.",
+        ],
+    })
+
+    # truncation: query above 1024 tokens, one document above 8192 tokens
+    cases.append({
+        "name": "truncation",
+        "query": "which document talks about the ocean? " + "please answer carefully " * 400,
+        "documents": [
+            "The ocean covers about 71 percent of the Earth's surface. " * 900,
+            "Mountains are formed by tectonic forces.",
+            "The deep ocean is cold and dark.",
+        ],
+    })
     return cases
 
 
