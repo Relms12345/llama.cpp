@@ -1295,6 +1295,12 @@ private:
                 return false;
             }
 
+            // without dense_2/dense_3 the scores would come from raw hidden states
+            if (llama_model_n_embd_out(model_tgt) == llama_model_n_embd(model_tgt)) {
+                SRV_ERR("%s", "Jina reranker: GGUF has no projector (dense_2/dense_3); re-convert it with convert_hf_to_gguf.py\n");
+                return false;
+            }
+
             jina_embed_token  = embed_ids[0];
             jina_rerank_token = rerank_ids[0];
 

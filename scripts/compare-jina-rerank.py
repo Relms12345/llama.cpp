@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """Compare jina-reranker-v3.5 scores: Hugging Face reference vs llama-server /v1/rerank.
 
-Step 1 (needs torch + transformers, GPU optional):
-    python scripts/compare-jina-rerank.py dump-hf --model jinaai/jina-reranker-v3.5 --out ref.json
+Regression test (no torch needed; uses the committed scripts/jina-rerank-ref.json):
+    python scripts/compare-jina-rerank.py run --model jina-reranker-v3.5-Q8_0.gguf
+This starts build/bin/llama-server once per entry in CONFIGS ("reference": -np 1 -c 131072,
+"nix": the router preset in scripts/jina-rerank-nix.ini) and checks every case against the
+reference. Use --config to pick one, --server-bin for another build, --extra for e.g. -ngl 99.
 
-Step 2 (start llama-server with the GGUF first, e.g.
-    llama-server -m jina-reranker-v3.5-Q8_0.gguf --embedding --pooling none --attention causal -c 32768 --port 8080):
-    python scripts/compare-jina-rerank.py compare --ref ref.json --server http://127.0.0.1:8080
+Refresh the reference after changing the cases (needs torch + transformers):
+    python scripts/compare-jina-rerank.py dump-hf --model jinaai/jina-reranker-v3.5 --out scripts/jina-rerank-ref.json
 
-Both steps can run on different machines; ref.json carries the test cases.
+Check a server that is already running:
+    python scripts/compare-jina-rerank.py compare --server http://127.0.0.1:8080 [--model NAME]
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import random
+import subprocess
 import sys
+import tempfile
+import time
 import urllib.request
 
 
@@ -132,6 +140,10 @@ def select_cases(cases: list[dict], names: str | None) -> list[dict]:
     return [c for c in cases if c["name"] in wanted]
 
 
+def case_hash(case: dict) -> str:
+    return hashlib.sha256(json.dumps([case["query"], case["documents"]]).encode()).hexdigest()
+
+
 def normalize_results(results, n_docs: int) -> list[float]:
     """Accept the common shapes returned by HF rerank() helpers and return scores in input order."""
     scores = [math.nan] * n_docs
@@ -157,21 +169,43 @@ def dump_hf(args) -> None:
     if not hasattr(model, "rerank"):
         sys.exit("model has no rerank() method; check the model card for the reference API")
 
+    # only scores and a hash are stored; the cases are rebuilt from build_cases()
     out = {"model": args.model, "dtype": args.dtype, "cases": []}
     for case in select_cases(build_cases(), args.cases):
         with torch.no_grad():
             results = model.rerank(case["query"], case["documents"], top_n=len(case["documents"]))
-        case = dict(case, ref_scores=normalize_results(results, len(case["documents"])))
-        out["cases"].append(case)
+        scores = normalize_results(results, len(case["documents"]))
+        out["cases"].append({"name": case["name"], "sha256": case_hash(case), "ref_scores": scores})
         print(f"{case['name']}: {len(case['documents'])} docs")
     with open(args.out, "w") as f:
-        json.dump(out, f)
+        json.dump(out, f, indent=1)
     print("wrote", args.out)
 
 
-def llama_scores(server: str, query: str, docs: list[str]) -> list[float]:
-    body = json.dumps({"query": query, "documents": docs, "top_n": len(docs)}).encode()
-    req = urllib.request.Request(server.rstrip("/") + "/v1/rerank", data=body,
+def load_refs(paths: list[str], names: str | None) -> tuple[dict, list[dict]]:
+    """Merge dump-hf outputs and attach the query/documents of each case."""
+    meta: dict = {}
+    by_name = {c["name"]: c for c in build_cases()}
+    cases = []
+    for path in paths:
+        with open(path) as f:
+            r = json.load(f)
+        meta.update({k: v for k, v in r.items() if k != "cases"})
+        for c in r["cases"]:
+            if "documents" not in c:
+                src = by_name.get(c["name"])
+                if src is None or case_hash(src) != c["sha256"]:
+                    sys.exit(f"{path}: case {c['name']!r} differs from build_cases(); re-run dump-hf")
+                c = dict(src, **c)
+            cases.append(c)
+    return meta, select_cases(cases, names)
+
+
+def llama_scores(server: str, query: str, docs: list[str], model: str | None = None) -> list[float]:
+    req_body = {"query": query, "documents": docs, "top_n": len(docs)}
+    if model:
+        req_body["model"] = model
+    req = urllib.request.Request(server.rstrip("/") + "/v1/rerank", data=json.dumps(req_body).encode(),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=3600) as r:
         resp = json.load(r)
@@ -205,58 +239,153 @@ def topk(xs: list[float], k: int) -> list[int]:
     return sorted(range(len(xs)), key=lambda i: -xs[i])[:k]
 
 
-def compare(args) -> None:
-    ref = {"cases": []}
-    for path in args.ref:
-        with open(path) as f:
-            r = json.load(f)
-        ref.update({k: v for k, v in r.items() if k != "cases"})
-        ref["cases"] += r["cases"]
-    ref["cases"] = select_cases(ref["cases"], args.cases)
-
-    failed = False
-    print(f"reference: {ref.get('model')} ({ref.get('dtype')})\n")
+def compare_cases(cases: list[dict], server: str, model: str | None, max_abs: float, min_spearman: float,
+                  min_top5: float, verbose: bool = False) -> bool:
+    """Score every case on the server and check it against the reference; returns True if all pass."""
+    all_ok = True
     print(f"{'case':<16}{'docs':>5}{'max|d|':>9}{'mean|d|':>9}{'pearson':>9}{'spearman':>9}{'top1':>6}{'top5':>6}")
-    for case in ref["cases"]:
+    for case in cases:
         a = case["ref_scores"]
-        b = llama_scores(args.server, case["query"], case["documents"])
+        b = llama_scores(server, case["query"], case["documents"], model)
         diffs = [abs(x - y) for x, y in zip(a, b)]
         sp = pearson(ranks(a), ranks(b))
         top1 = topk(a, 1) == topk(b, 1)
         k = min(5, len(a))
         top5 = len(set(topk(a, k)) & set(topk(b, k))) / k
-        ok = max(diffs) <= args.max_abs and (sp >= args.min_spearman or len(a) < 4) and top1
-        failed |= not ok
+        ok = max(diffs) <= max_abs and (sp >= min_spearman or len(a) < 4) and top1 and top5 >= min_top5
+        all_ok &= ok
         print(f"{case['name']:<16}{len(a):>5}{max(diffs):>9.4f}{sum(diffs) / len(diffs):>9.4f}"
               f"{pearson(a, b):>9.4f}{sp:>9.4f}{str(top1):>6}{top5:>6.2f}  {'OK' if ok else 'FAIL'}")
-        if args.verbose or not ok:
+        if verbose or not ok:
             for i in topk(a, min(10, len(a))):
                 print(f"    doc {i:>3}: ref {a[i]:+.4f}  llama {b[i]:+.4f}")
+    return all_ok
 
-    print("\nPASS" if not failed else "\nFAIL (see cases above)")
-    sys.exit(1 if failed else 0)
+
+def compare(args) -> None:
+    meta, cases = load_refs(args.ref, args.cases)
+    print(f"reference: {meta.get('model')} ({meta.get('dtype')})\n")
+    ok = compare_cases(cases, args.server, args.model, args.max_abs, args.min_spearman, args.min_top5, args.verbose)
+    print("\nPASS" if ok else "\nFAIL (see cases above)")
+    sys.exit(0 if ok else 1)
+
+
+# Server configurations checked by `run`. Tolerances are against the HF fp32 reference
+# for a Q8_0 GGUF; "nix" splits large requests into more blocks than the reference
+# (8192-token slots), so it is held to ranking checks with a looser score bound.
+CONFIGS = {
+    # the reference block size: one slot with the full 131072-token context
+    "reference": {
+        "args": ["-m", "{model}", "--embedding", "--pooling", "none", "--attention", "causal",
+                 "-np", "1", "-c", "131072"],
+        "max_abs": 0.01, "min_spearman": 0.99, "min_top5": 1.0,
+    },
+    # router mode with the preset from relms/flake systems/llama.nix
+    "nix": {
+        "preset": "jina-rerank-nix.ini",
+        "router_model": "hf.co/jinaai/jina-reranker-v3.5-GGUF:Q8_0",
+        "args": ["--models-preset", "{preset}", "--models-max", "3", "--models-autoload"],
+        "max_abs": 0.01, "min_spearman": 0.99, "min_top5": 1.0,
+    },
+}
+
+
+def wait_healthy(url: str, proc: subprocess.Popen, timeout: float) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"llama-server exited with code {proc.returncode}")
+        try:
+            with urllib.request.urlopen(url + "/health", timeout=5) as r:
+                if r.status == 200:
+                    return
+        except Exception:
+            pass
+        time.sleep(1)
+    raise RuntimeError("llama-server did not become healthy")
+
+
+def run(args) -> None:
+    meta, cases = load_refs(args.ref, args.cases)
+    print(f"reference: {meta.get('model')} ({meta.get('dtype')})")
+    names = args.config or list(CONFIGS)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    results = {}
+    for name in names:
+        cfg = CONFIGS[name]
+        with tempfile.TemporaryDirectory() as tmp:
+            subst = {"model": os.path.abspath(args.model)}
+            if "preset" in cfg:
+                with open(os.path.join(script_dir, cfg["preset"])) as f:
+                    ini = f.read().replace("{model}", subst["model"])
+                subst["preset"] = os.path.join(tmp, "preset.ini")
+                with open(subst["preset"], "w") as f:
+                    f.write(ini)
+            cmd = [args.server_bin] + [a.format(**subst) for a in cfg["args"]]
+            cmd += ["--host", "127.0.0.1", "--port", str(args.port)] + args.extra
+            log_path = os.path.join(args.log_dir or tmp, f"llama-server-{name}.log")
+            print(f"\n=== {name}: {' '.join(cmd)}")
+            with open(log_path, "w") as log:
+                proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+                try:
+                    url = f"http://127.0.0.1:{args.port}"
+                    wait_healthy(url, proc, args.startup_timeout)
+                    ok = compare_cases(cases, url, cfg.get("router_model"), cfg["max_abs"], cfg["min_spearman"],
+                                       cfg["min_top5"], args.verbose)
+                except Exception as e:
+                    print(f"error: {e}")
+                    ok = False
+                finally:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=60)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+            if not ok:
+                with open(log_path) as f:
+                    tail = f.readlines()[-20:]
+                print(f"--- last lines of {log_path}:\n" + "".join(tail))
+        results[name] = ok
+    print("\n" + "\n".join(f"{n:<12} {'PASS' if ok else 'FAIL'}" for n, ok in results.items()))
+    sys.exit(0 if all(results.values()) else 1)
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
+    default_ref = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "jina-rerank-ref.json")]
 
     d = sub.add_parser("dump-hf", help="compute reference scores with transformers")
     d.add_argument("--model", default="jinaai/jina-reranker-v3.5")
-    d.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
+    d.add_argument("--dtype", default="fp32", choices=["bf16", "fp16", "fp32"])
     d.add_argument("--device", default="cuda" if _has_cuda() else "cpu")
     d.add_argument("--out", default="ref.json")
     d.add_argument("--cases", help="comma-separated case names (default: all)")
     d.set_defaults(func=dump_hf)
 
-    c = sub.add_parser("compare", help="compare llama-server against reference scores")
-    c.add_argument("--ref", nargs="+", default=["ref.json"], help="one or more dump-hf outputs")
+    c = sub.add_parser("compare", help="compare a running llama-server against reference scores")
+    c.add_argument("--ref", nargs="+", default=default_ref, help="one or more dump-hf outputs")
     c.add_argument("--cases", help="comma-separated case names (default: all)")
     c.add_argument("--server", default="http://127.0.0.1:8080")
+    c.add_argument("--model", help="model name to send (router mode)")
     c.add_argument("--max-abs", type=float, default=0.01, help="max allowed |score diff| (Q8_0 vs fp32 is about 0.006)")
     c.add_argument("--min-spearman", type=float, default=0.98)
+    c.add_argument("--min-top5", type=float, default=0.0, help="min top-5 overlap with the reference")
     c.add_argument("-v", "--verbose", action="store_true")
     c.set_defaults(func=compare)
+
+    r = sub.add_parser("run", help="start llama-server for each config in CONFIGS and compare (regression test)")
+    r.add_argument("--model", required=True, help="GGUF file")
+    r.add_argument("--server-bin", default="build/bin/llama-server")
+    r.add_argument("--config", action="append", choices=list(CONFIGS), help="config to run (default: all)")
+    r.add_argument("--ref", nargs="+", default=default_ref, help="one or more dump-hf outputs")
+    r.add_argument("--cases", help="comma-separated case names (default: all)")
+    r.add_argument("--port", type=int, default=8097)
+    r.add_argument("--startup-timeout", type=float, default=600)
+    r.add_argument("--log-dir", help="keep server logs here")
+    r.add_argument("--extra", nargs=argparse.REMAINDER, default=[], help="extra llama-server args (must be last)")
+    r.add_argument("-v", "--verbose", action="store_true")
+    r.set_defaults(func=run)
 
     args = p.parse_args()
     args.func(args)
