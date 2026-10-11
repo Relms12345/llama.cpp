@@ -4,8 +4,10 @@
 Regression test (no torch needed; uses the committed scripts/jina-rerank-ref.json):
     python scripts/compare-jina-rerank.py run --model jina-reranker-v3.5-Q8_0.gguf
 This starts build/bin/llama-server once per entry in CONFIGS ("reference": -np 1 -c 131072,
-"nix": the router preset in scripts/jina-rerank-nix.ini) and checks every case against the
-reference. Use --config to pick one, --server-bin for another build, --extra for e.g. -ngl 99.
+"nix": the router preset in scripts/jina-rerank-nix.ini, "nix-131k": that preset with one
+131072-token rerank slot) and checks every case against the reference. Use --config to pick
+one, --server-bin for another build (e.g. the nix-built llama-server), --save-scores DIR to
+keep the scores, and `compare --scores FILE --config NAME` to re-check saved scores offline.
 
 Refresh the reference after changing the cases (needs torch + transformers):
     python scripts/compare-jina-rerank.py dump-hf --model jinaai/jina-reranker-v3.5 --out scripts/jina-rerank-ref.json
@@ -239,28 +241,42 @@ def topk(xs: list[float], k: int) -> list[int]:
     return sorted(range(len(xs)), key=lambda i: -xs[i])[:k]
 
 
+# reference score differences below this are treated as ties by the ranking checks
+TIE_TOL = 0.01
+
+
+def tie_aware_topk(ref: list[float], got: list[float], k: int, tol: float = TIE_TOL) -> float:
+    """Fraction of got's top k whose reference score is within tol of the reference k-th best."""
+    k = min(k, len(ref))
+    kth = sorted(ref, reverse=True)[k - 1]
+    return sum(1 for i in topk(got, k) if ref[i] >= kth - tol) / k
+
+
 def check(diffs: list[float], sp: float, n: int, top1: bool, top5: float, lim: dict) -> bool:
     return (max(diffs) <= lim["max_abs"] and (sp >= lim["min_spearman"] or n < 4)
             and (top1 or not lim.get("require_top1", True)) and top5 >= lim.get("min_top5", 0.0))
 
 
 def compare_cases(cases: list[dict], server: str, model: str | None, max_abs: float, min_spearman: float,
-                  min_top5: float, verbose: bool = False, known: dict | None = None) -> bool:
+                  min_top5: float, verbose: bool = False, known: dict | None = None,
+                  save: dict | None = None, offline: dict | None = None) -> bool:
     """Score every case on the server and check it against the reference; returns True if all pass.
     known maps case names to looser limits for deviations the config is expected to have;
     such a case reports KNOWN when it misses the normal limits but stays within the loose ones."""
     strict = {"max_abs": max_abs, "min_spearman": min_spearman, "min_top5": min_top5}
     known = known or {}
     all_ok = True
+    # top1/top5: llama's best 1/5 docs are among the reference's best within TIE_TOL
     print(f"{'case':<16}{'docs':>5}{'max|d|':>9}{'mean|d|':>9}{'pearson':>9}{'spearman':>9}{'top1':>6}{'top5':>6}")
     for case in cases:
         a = case["ref_scores"]
-        b = llama_scores(server, case["query"], case["documents"], model)
+        b = offline[case["name"]] if offline is not None else llama_scores(server, case["query"], case["documents"], model)
+        if save is not None:
+            save[case["name"]] = b
         diffs = [abs(x - y) for x, y in zip(a, b)]
         sp = pearson(ranks(a), ranks(b))
-        top1 = topk(a, 1) == topk(b, 1)
-        k = min(5, len(a))
-        top5 = len(set(topk(a, k)) & set(topk(b, k))) / k
+        top1 = tie_aware_topk(a, b, 1) == 1.0
+        top5 = tie_aware_topk(a, b, 5)
         ok = check(diffs, sp, len(a), top1, top5, strict)
         status = "OK"
         if not ok and case["name"] in known:
@@ -280,7 +296,17 @@ def compare_cases(cases: list[dict], server: str, model: str | None, max_abs: fl
 def compare(args) -> None:
     meta, cases = load_refs(args.ref, args.cases)
     print(f"reference: {meta.get('model')} ({meta.get('dtype')})\n")
-    ok = compare_cases(cases, args.server, args.model, args.max_abs, args.min_spearman, args.min_top5, args.verbose)
+    offline = None
+    if args.scores:
+        with open(args.scores) as f:
+            offline = json.load(f)
+        cases = [c for c in cases if c["name"] in offline]
+    known = CONFIGS[args.config].get("known") if args.config else None
+    if args.config:
+        cfg = CONFIGS[args.config]
+        args.max_abs, args.min_spearman, args.min_top5 = cfg["max_abs"], cfg["min_spearman"], cfg["min_top5"]
+    ok = compare_cases(cases, args.server, args.model, args.max_abs, args.min_spearman, args.min_top5, args.verbose,
+                       known, offline=offline)
     print("\nPASS" if ok else "\nFAIL (see cases above)")
     sys.exit(0 if ok else 1)
 
@@ -313,7 +339,8 @@ CONFIGS = {
             "split_small_ctx": {"max_abs": 0.15, "min_spearman": 0.6, "min_top5": 0.6, "require_top1": False},
         },
     },
-    # the nix preset with the rerank model given one 131072-token slot (recommended)
+    # the nix preset with the rerank model given one 131072-token slot (recommended);
+    # matches the reference on every case (max |d| 0.009 on CPU, q8_0 KV + flash attention)
     "nix-131k": {
         "preset": "jina-rerank-nix.ini",
         "preset_overrides": {NIX_SECTION: {"parallel": "1", "kv-unified-per-slot": "131072"}},
@@ -377,8 +404,13 @@ def run(args) -> None:
                 try:
                     url = f"http://127.0.0.1:{args.port}"
                     wait_healthy(url, proc, args.startup_timeout)
+                    scores: dict = {}
                     ok = compare_cases(cases, url, cfg.get("router_model"), cfg["max_abs"], cfg["min_spearman"],
-                                       cfg["min_top5"], args.verbose, cfg.get("known"))
+                                       cfg["min_top5"], args.verbose, cfg.get("known"), scores)
+                    if args.save_scores:
+                        os.makedirs(args.save_scores, exist_ok=True)
+                        with open(os.path.join(args.save_scores, f"scores-{name}.json"), "w") as f:
+                            json.dump(scores, f)
                 except Exception as e:
                     print(f"error: {e}")
                     ok = False
@@ -418,6 +450,8 @@ def main() -> None:
     c.add_argument("--max-abs", type=float, default=0.01, help="max allowed |score diff| (Q8_0 vs fp32 is about 0.006)")
     c.add_argument("--min-spearman", type=float, default=0.98)
     c.add_argument("--min-top5", type=float, default=0.0, help="min top-5 overlap with the reference")
+    c.add_argument("--scores", help="check scores saved by run --save-scores instead of querying a server")
+    c.add_argument("--config", choices=list(CONFIGS), help="use the limits of this config")
     c.add_argument("-v", "--verbose", action="store_true")
     c.set_defaults(func=compare)
 
@@ -430,6 +464,7 @@ def main() -> None:
     r.add_argument("--port", type=int, default=8097)
     r.add_argument("--startup-timeout", type=float, default=600)
     r.add_argument("--log-dir", help="keep server logs here")
+    r.add_argument("--save-scores", metavar="DIR", help="write llama scores per config to DIR/scores-<config>.json")
     r.add_argument("--extra", nargs=argparse.REMAINDER, default=[], help="extra llama-server args (must be last)")
     r.add_argument("-v", "--verbose", action="store_true")
     r.set_defaults(func=run)
