@@ -394,6 +394,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DENSE_2_FEAT_OUT,       "%s.dense_2_feat_out" },
     { LLM_KV_DENSE_3_FEAT_IN,        "%s.dense_3_feat_in"  },
     { LLM_KV_DENSE_3_FEAT_OUT,       "%s.dense_3_feat_out" },
+    { LLM_KV_DENSE_ACTIVATION,       "%s.dense_activation" },
 
     { LLM_KV_TOKENIZER_MODEL,                    "tokenizer.ggml.model"                    },
     { LLM_KV_TOKENIZER_PRE,                      "tokenizer.ggml.pre"                      },
@@ -742,8 +743,6 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,                 "selector_hidden" },
     { LLM_TENSOR_ATTN_V_GATE,                            "blk.%d.attn_v_gate" },
     { LLM_TENSOR_ATTN_V_EXPS,                            "blk.%d.attn_v_exps" },
-    { LLM_TENSOR_RERANK_PROJ_0,                          "rerank.projector.0" },
-    { LLM_TENSOR_RERANK_PROJ_2,                          "rerank.projector.2" },
 };
 
 // declare information about the model weight tensors:
@@ -1056,8 +1055,6 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_V_GATE,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_V_EXPS,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
-    {LLM_TENSOR_RERANK_PROJ_0,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
-    {LLM_TENSOR_RERANK_PROJ_2,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}

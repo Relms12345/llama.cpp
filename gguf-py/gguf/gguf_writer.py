@@ -864,6 +864,9 @@ class GGUFWriter:
         self.add_uint32(Keys.LLM.DENSE_FEAT_IN_SIZE.format(arch=self.arch, dense=dense), in_f)
         self.add_uint32(Keys.LLM.DENSE_FEAT_OUT_SIZE.format(arch=self.arch, dense=dense), out_f)
 
+    def add_dense_activation(self, value: str) -> None:
+        self.add_string(Keys.LLM.DENSE_ACTIVATION.format(arch=self.arch), value)
+
     def add_logit_scale(self, value: float) -> None:
         self.add_float32(Keys.LLM.LOGIT_SCALE.format(arch=self.arch), value)
 

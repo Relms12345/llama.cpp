@@ -3893,6 +3893,9 @@ void llm_graph_context::build_dense_out(
     if (dense_2_b) {
         cur = ggml_add(ctx0, cur, dense_2_b);
     }
+    if (dense_3 && hparams.act_dense != GGML_UNARY_OP_COUNT) {
+        cur = ggml_unary(ctx0, cur, hparams.act_dense);
+    }
     if (dense_3) {
         cur = ggml_mul_mat(ctx0, dense_3, cur);
     }

@@ -163,6 +163,7 @@ class Keys:
         HIDDEN_ACT                        = "{arch}.hidden_activation"
         DENSE_FEAT_IN_SIZE                = "{arch}.{dense}_feat_in"
         DENSE_FEAT_OUT_SIZE               = "{arch}.{dense}_feat_out"
+        DENSE_ACTIVATION                  = "{arch}.dense_activation"
         TARGET_LAYERS                     = "{arch}.target_layers"
         TARGET_HIDDEN_SIZE                = "{arch}.target_hidden_size"
         BLOCK_SIZE                        = "{arch}.block_size"
@@ -2829,6 +2830,8 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE,
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.DENSE_2_OUT,
+        MODEL_TENSOR.DENSE_3_OUT,
     ],
     MODEL_ARCH.QWEN3MOE: [
         MODEL_TENSOR.TOKEN_EMBD,

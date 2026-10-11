@@ -1103,6 +1103,7 @@ static const std::map<std::string, llm_ffn_op_type> LLM_FFN_OP_TYPES_FROM_STRING
 // transformers names, "gelu" is the exact (erf) variant
 static const std::map<std::string, ggml_unary_op> LLM_CLS_ACT_TYPES_FROM_STRING = {
     { "gelu", GGML_UNARY_OP_GELU_ERF },
+    { "relu", GGML_UNARY_OP_RELU     },
     { "silu", GGML_UNARY_OP_SILU     },
     { "tanh", GGML_UNARY_OP_TANH     },
 };
@@ -1370,6 +1371,12 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         const auto it = LLM_CLS_ACT_TYPES_FROM_STRING.find(act_cls);
         GGML_ASSERT(it != LLM_CLS_ACT_TYPES_FROM_STRING.end() && "unsupported classifier activation");
         hparams.act_cls = it->second;
+    }
+    std::string act_dense;
+    if (ml.get_key(LLM_KV_DENSE_ACTIVATION, act_dense, false)) {
+        const auto it = LLM_CLS_ACT_TYPES_FROM_STRING.find(act_dense);
+        GGML_ASSERT(it != LLM_CLS_ACT_TYPES_FROM_STRING.end() && "unsupported dense activation");
+        hparams.act_dense = it->second;
     }
     ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer_all);
     GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);

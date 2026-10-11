@@ -1000,6 +1000,10 @@ public:
         return (uint32_t) n_ctx_slot();
     }
 
+    enum llama_pooling_type pooling_type() const {
+        return llama_pooling_type(ctx_tgt);
+    }
+
     void reset_metrics_bucket() {
         metrics.reset_bucket();
     }
@@ -2556,7 +2560,6 @@ private:
             res->jina_n_docs = (int32_t) n_docs;
             res->jina_query_embedding = query_late;
             res->jina_doc_embeddings.reserve(n_docs * (size_t) n_embd);
-            res->scores.reserve(n_docs);
 
             auto cosine_similarity = [](const std::vector<float> & a,
                                         const std::vector<float> & b) {
@@ -2584,7 +2587,6 @@ private:
                     res->jina_doc_embeddings.end(), doc.begin(), doc.end());
 
                 const float score = cosine_similarity(doc, query_late);
-                res->scores.push_back(score);
                 block_weight = std::max(block_weight, (1.0f + score) * 0.5f);
             }
 
@@ -4144,18 +4146,10 @@ private:
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
-                        bool output = slot.need_embd();
-
-                        if (is_jina_reranker &&
-                            slot.task != nullptr &&
-                            slot.task->type == SERVER_TASK_TYPE_RERANK) {
-                            output = true;
-                        }
-
                         add_ok &= batch.add(slot.id,
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
-                            /* output    = */ output,
+                            /* output    = */ slot.need_embd(),
                             /* is_prompt = */ true);
                         if (!slot.task->decision.order.empty()) {
                             batch.set_decision_order(batch.size() - 1, slot.task->decision.order[slot.prompt.n_tokens()]);
@@ -5864,26 +5858,21 @@ void server_routes::init_routes() {
     };
 
     this->post_rerank = [this](const server_http_req & req) {
+        if (ctx_server.is_jina_reranker_model()) {
+            return handle_rerank_jina(req);
+        }
+
         auto res = create_response();
-
-        const bool jina_rerank = ctx_server.is_jina_reranker_model();
-        const bool rerank_supported =
-            params.embedding &&
-            ((!jina_rerank && params.pooling_type == LLAMA_POOLING_TYPE_RANK) ||
-             ( jina_rerank && params.pooling_type == LLAMA_POOLING_TYPE_NONE));
-
-        if (!rerank_supported) {
-            res->error(format_error_response(
-                jina_rerank
-                    ? "Jina reranker v3.5 requires embedding mode with pooling=none"
-                    : "This server does not support reranking. Start it with `--reranking`",
-                ERROR_TYPE_NOT_SUPPORTED));
+        if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
+            res->error(format_error_response("This server does not support reranking. Start it with `--reranking`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
 
         const json body = json::parse(req.body);
 
         // if true, use TEI API format, otherwise use Jina API format
+        // Jina: https://jina.ai/reranker/
+        // TEI: https://huggingface.github.io/text-embeddings-inference/#/Text%20Embeddings%20Inference/rerank
         bool is_tei_format = body.contains("texts");
 
         json query;
@@ -5905,230 +5894,41 @@ void server_routes::init_routes() {
             return res;
         }
 
-        int top_n = json_value(body, "top_n", (int) documents.size());
+        int top_n = json_value(body, "top_n", (int)documents.size());
 
+        // create and queue the task
         json responses = json::array();
         auto & rd = res->rd;
-        server_response_reader::batch_response all_results;
-
-        if (jina_rerank) {
-            constexpr size_t JINA_BLOCK_SIZE             = 125;
-            const size_t JINA_MAX_LENGTH                 = std::min<size_t>(ctx_server.slot_context_size(), 131072);
-            const size_t JINA_TOKENS_PER_BATCH           = JINA_MAX_LENGTH;
-            constexpr size_t JINA_MODEL_MAX_QUERY_LENGTH = 2048;
-            constexpr size_t JINA_MODEL_MAX_DOC_LENGTH   = 8192;
-            const size_t JINA_PROMPT_RESERVE             = std::clamp<size_t>(JINA_MAX_LENGTH / 16, 512, 2048);
-            const size_t JINA_MAX_QUERY_LENGTH           = std::min<size_t>(
-                JINA_MODEL_MAX_QUERY_LENGTH,
-                std::max<size_t>(512, (JINA_MAX_LENGTH * 21) / 100 + 64));
-            const size_t jina_doc_budget =
-                JINA_MAX_LENGTH > (2 * JINA_MAX_QUERY_LENGTH + JINA_PROMPT_RESERVE)
-                    ? JINA_MAX_LENGTH - 2 * JINA_MAX_QUERY_LENGTH - JINA_PROMPT_RESERVE
-                    : 2;
-            const size_t JINA_MAX_DOC_LENGTH = std::min<size_t>(
-                JINA_MODEL_MAX_DOC_LENGTH,
-                std::max<size_t>(2, jina_doc_budget));
-
-            const auto plan = make_jina_rerank_blocks(
-                ctx_server.vocab,
-                query.get<std::string>(),
-                documents,
-                JINA_BLOCK_SIZE,
-                JINA_MAX_LENGTH,
-                JINA_MAX_QUERY_LENGTH,
-                JINA_MAX_DOC_LENGTH,
-                JINA_TOKENS_PER_BATCH);
-
-            all_results.results.reserve(plan.blocks.size());
-
-            for (size_t block_idx = 0; block_idx < plan.blocks.size(); ++block_idx) {
-                server_task task(SERVER_TASK_TYPE_RERANK);
-                task.id = rd.get_new_id();
-                task.tokens = format_prompt_rerank_jina(
-                    ctx_server.vocab, plan.query, plan.blocks[block_idx]);
-
-                server_response_reader block_rd(
-                    rd.queue_tasks,
-                    rd.queue_results,
-                    rd.polling_interval_seconds);
-
-                block_rd.post_task(std::move(task));
-                auto result = block_rd.next(req.should_stop);
-
-                if (!result) {
-                    all_results.is_terminated = true;
-                    break;
-                }
-                if (result->is_error()) {
-                    all_results.error = std::move(result);
-                    break;
-                }
-
-                result->index = block_idx;
-                all_results.results.push_back(std::move(result));
-            }
-        } else {
+        {
             std::vector<server_task> tasks;
             tasks.reserve(documents.size());
-
-            for (size_t i = 0; i < documents.size(); ++i) {
-                server_task task(SERVER_TASK_TYPE_RERANK);
-                task.id = rd.get_new_id();
-                task.tokens = format_prompt_rerank(
-                    ctx_server.model_tgt,
-                    ctx_server.vocab,
-                    ctx_server.mctx,
-                    query,
-                    documents[i],
-                    ctx_server.init_opt);
+            for (size_t i = 0; i < documents.size(); i++) {
+                auto tmp = format_prompt_rerank(ctx_server.model_tgt, ctx_server.vocab, ctx_server.mctx, query, documents[i], ctx_server.init_opt);
+                server_task task = server_task(SERVER_TASK_TYPE_RERANK);
+                task.id     = rd.get_new_id();
+                task.tokens = std::move(tmp);
                 tasks.push_back(std::move(task));
             }
-
             rd.post_tasks(std::move(tasks));
-            all_results = rd.wait_for_all(req.should_stop);
         }
 
+        // wait for the results
+        auto all_results = rd.wait_for_all(req.should_stop);
+
+        // collect results
         if (all_results.is_terminated) {
-            return res;
-        }
-        if (all_results.error) {
+            return res; // connection is closed
+        } else if (all_results.error) {
             res->error(all_results.error->to_json());
             return res;
-        }
-
-        if (jina_rerank) {
-            std::vector<server_task_result_rerank *> blocks;
-            blocks.reserve(all_results.results.size());
-
-            for (auto & result : all_results.results) {
-                auto * rerank_res = dynamic_cast<server_task_result_rerank *>(result.get());
-                GGML_ASSERT(rerank_res != nullptr);
-                blocks.push_back(rerank_res);
-            }
-
-            std::sort(blocks.begin(), blocks.end(), [](const auto * a, const auto * b) {
-                return a->index < b->index;
-            });
-
-            if (blocks.empty()) {
-                res->error(format_error_response(
-                    "Jina reranker returned no block results",
-                    ERROR_TYPE_SERVER));
-                return res;
-            }
-
-            if (blocks.size() == 1) {
-                const auto * block = blocks[0];
-                if (block->scores.size() != documents.size()) {
-                    res->error(format_error_response(
-                        string_format(
-                            "Jina reranker returned %zu scores for %zu documents",
-                            block->scores.size(), documents.size()),
-                        ERROR_TYPE_SERVER));
-                    return res;
-                }
-
-                for (size_t i = 0; i < block->scores.size(); ++i) {
-                    responses.push_back(json{
-                        {"index", i},
-                        {"score", block->scores[i]},
-                        {"tokens_evaluated", i == 0 ? block->n_tokens : 0},
-                    });
-                }
-            } else {
-                const int32_t n_embd = llama_model_n_embd_out(ctx_server.model_tgt);
-                std::vector<double> query_fused((size_t) n_embd, 0.0);
-                double weight_sum = 0.0;
-
-                for (const auto * block : blocks) {
-                    if (block->jina_query_embedding.size() != (size_t) n_embd) {
-                        res->error(format_error_response(
-                            "Jina reranker returned an invalid query embedding",
-                            ERROR_TYPE_SERVER));
-                        return res;
-                    }
-
-                    const double weight = (double) block->jina_block_weight;
-                    weight_sum += weight;
-                    for (int32_t j = 0; j < n_embd; ++j) {
-                        query_fused[j] += weight * (double) block->jina_query_embedding[j];
-                    }
-                }
-
-                if (weight_sum <= 0.0) {
-                    res->error(format_error_response(
-                        "Jina reranker produced zero total block weight",
-                        ERROR_TYPE_SERVER));
-                    return res;
-                }
-
-                for (double & value : query_fused) {
-                    value /= weight_sum;
-                }
-
-                int32_t total_prompt_tokens = 0;
-                for (const auto * block : blocks) {
-                    total_prompt_tokens += block->n_tokens;
-                }
-
-                size_t global_doc_index = 0;
-                for (const auto * block : blocks) {
-                    const size_t expected_size =
-                        (size_t) block->jina_n_docs * (size_t) n_embd;
-
-                    if (block->jina_doc_embeddings.size() != expected_size) {
-                        res->error(format_error_response(
-                            "Jina reranker returned an invalid document embedding buffer",
-                            ERROR_TYPE_SERVER));
-                        return res;
-                    }
-
-                    for (int32_t d = 0; d < block->jina_n_docs; ++d) {
-                        const float * doc =
-                            block->jina_doc_embeddings.data() +
-                            (size_t) d * (size_t) n_embd;
-
-                        double dot = 0.0;
-                        double nd  = 0.0;
-                        double nq  = 0.0;
-
-                        for (int32_t j = 0; j < n_embd; ++j) {
-                            const double dv = (double) doc[j];
-                            const double qv = query_fused[j];
-                            dot += dv * qv;
-                            nd  += dv * dv;
-                            nq  += qv * qv;
-                        }
-
-                        const float score =
-                            (float) (dot / (std::sqrt(nd) * std::sqrt(nq) + 1e-8));
-
-                        responses.push_back(json{
-                            {"index", global_doc_index},
-                            {"score", score},
-                            {"tokens_evaluated",
-                                global_doc_index == 0 ? total_prompt_tokens : 0},
-                        });
-                        ++global_doc_index;
-                    }
-                }
-
-                if (global_doc_index != documents.size()) {
-                    res->error(format_error_response(
-                        string_format(
-                            "Jina reranker produced %zu document scores for %zu documents",
-                            global_doc_index, documents.size()),
-                        ERROR_TYPE_SERVER));
-                    return res;
-                }
-            }
         } else {
-            for (auto & result : all_results.results) {
-                GGML_ASSERT(dynamic_cast<server_task_result_rerank *>(result.get()) != nullptr);
-                responses.push_back(result->to_json());
+            for (auto & res : all_results.results) {
+                GGML_ASSERT(dynamic_cast<server_task_result_rerank*>(res.get()) != nullptr);
+                responses.push_back(res->to_json());
             }
         }
 
+        // write JSON response
         json root = format_response_rerank(
             body,
             meta->model_name,
@@ -6581,4 +6381,161 @@ void server_routes::update_cached_responses(bool is_sleeping) {
 
         should_reset_buckets = false;
     }
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_rerank_jina(const server_http_req & req) {
+    auto res = create_response();
+    if (!params.embedding || ctx_server.pooling_type() != LLAMA_POOLING_TYPE_NONE) {
+        res->error(format_error_response("Jina reranker requires `--embedding --pooling none`", ERROR_TYPE_NOT_SUPPORTED));
+        return res;
+    }
+
+    const json body = json::parse(req.body);
+
+    // if true, use TEI API format, otherwise use Jina API format
+    bool is_tei_format = body.contains("texts");
+
+    json query;
+    if (body.count("query") == 1) {
+        query = body.at("query");
+        if (!query.is_string()) {
+            res->error(format_error_response("\"query\" must be a string", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+    } else {
+        res->error(format_error_response("\"query\" must be provided", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    std::vector<std::string> documents = json_value(body, "documents",
+                                         json_value(body, "texts", std::vector<std::string>()));
+    if (documents.empty()) {
+        res->error(format_error_response("\"documents\" must be a non-empty string array", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    int top_n = json_value(body, "top_n", (int) documents.size());
+
+    // split the documents into listwise blocks that fit in a slot
+    constexpr size_t JINA_BLOCK_SIZE             = 125;
+    const size_t JINA_MAX_LENGTH                 = std::min<size_t>(ctx_server.slot_context_size(), 131072);
+    const size_t JINA_TOKENS_PER_BATCH           = JINA_MAX_LENGTH;
+    constexpr size_t JINA_MODEL_MAX_QUERY_LENGTH = 2048;
+    constexpr size_t JINA_MODEL_MAX_DOC_LENGTH   = 8192;
+    const size_t JINA_PROMPT_RESERVE             = std::clamp<size_t>(JINA_MAX_LENGTH / 16, 512, 2048);
+    const size_t JINA_MAX_QUERY_LENGTH           = std::min<size_t>(
+        JINA_MODEL_MAX_QUERY_LENGTH,
+        std::max<size_t>(512, (JINA_MAX_LENGTH * 21) / 100 + 64));
+    const size_t jina_doc_budget =
+        JINA_MAX_LENGTH > (2 * JINA_MAX_QUERY_LENGTH + JINA_PROMPT_RESERVE)
+            ? JINA_MAX_LENGTH - 2 * JINA_MAX_QUERY_LENGTH - JINA_PROMPT_RESERVE
+            : 2;
+    const size_t JINA_MAX_DOC_LENGTH = std::min<size_t>(
+        JINA_MODEL_MAX_DOC_LENGTH,
+        std::max<size_t>(2, jina_doc_budget));
+
+    const auto plan = make_jina_rerank_blocks(
+        ctx_server.vocab,
+        query.get<std::string>(),
+        documents,
+        JINA_BLOCK_SIZE,
+        JINA_MAX_LENGTH,
+        JINA_MAX_QUERY_LENGTH,
+        JINA_MAX_DOC_LENGTH,
+        JINA_TOKENS_PER_BATCH);
+
+    auto & rd = res->rd;
+    {
+        std::vector<server_task> tasks;
+        tasks.reserve(plan.blocks.size());
+        for (const auto & block : plan.blocks) {
+            server_task task(SERVER_TASK_TYPE_RERANK);
+            task.id     = rd.get_new_id();
+            task.tokens = format_prompt_rerank_jina(ctx_server.vocab, plan.query, block);
+            tasks.push_back(std::move(task));
+        }
+        rd.post_tasks(std::move(tasks));
+    }
+
+    auto all_results = rd.wait_for_all(req.should_stop);
+    if (all_results.is_terminated) {
+        return res; // connection is closed
+    }
+    if (all_results.error) {
+        res->error(all_results.error->to_json());
+        return res;
+    }
+
+    // fuse the per-block query embeddings, weighted by each block's best match
+    const int32_t n_embd = llama_model_n_embd_out(ctx_server.model_tgt);
+    std::vector<double> query_fused((size_t) n_embd, 0.0);
+    double  weight_sum          = 0.0;
+    int32_t total_prompt_tokens = 0;
+
+    std::vector<const server_task_result_rerank *> blocks;
+    blocks.reserve(all_results.results.size());
+    for (const auto & result : all_results.results) {
+        const auto * block = dynamic_cast<const server_task_result_rerank *>(result.get());
+        GGML_ASSERT(block != nullptr);
+        GGML_ASSERT(block->jina_query_embedding.size() == (size_t) n_embd);
+        GGML_ASSERT(block->jina_doc_embeddings.size() == (size_t) block->jina_n_docs * n_embd);
+
+        const double weight = block->jina_block_weight;
+        weight_sum += weight;
+        for (int32_t j = 0; j < n_embd; ++j) {
+            query_fused[j] += weight * block->jina_query_embedding[j];
+        }
+        total_prompt_tokens += block->n_tokens;
+        blocks.push_back(block);
+    }
+
+    if (weight_sum <= 0.0) {
+        res->error(format_error_response("Jina reranker produced zero total block weight", ERROR_TYPE_SERVER));
+        return res;
+    }
+    for (double & v : query_fused) {
+        v /= weight_sum;
+    }
+
+    json responses = json::array();
+    size_t doc_index = 0;
+    for (const auto * block : blocks) {
+        for (int32_t d = 0; d < block->jina_n_docs; ++d) {
+            const float * doc = block->jina_doc_embeddings.data() + (size_t) d * n_embd;
+
+            double dot = 0.0;
+            double nd  = 0.0;
+            double nq  = 0.0;
+            for (int32_t j = 0; j < n_embd; ++j) {
+                dot += doc[j] * query_fused[j];
+                nd  += (double) doc[j] * doc[j];
+                nq  += query_fused[j] * query_fused[j];
+            }
+
+            responses.push_back(json{
+                {"index",            doc_index},
+                {"score",            (float) (dot / (std::sqrt(nd) * std::sqrt(nq) + 1e-8))},
+                {"tokens_evaluated", doc_index == 0 ? total_prompt_tokens : 0},
+            });
+            ++doc_index;
+        }
+    }
+
+    if (doc_index != documents.size()) {
+        res->error(format_error_response(
+            string_format("Jina reranker produced %zu scores for %zu documents", doc_index, documents.size()),
+            ERROR_TYPE_SERVER));
+        return res;
+    }
+
+    json root = format_response_rerank(
+        body,
+        meta->model_name,
+        responses,
+        is_tei_format,
+        documents,
+        top_n);
+
+    res->ok(root);
+    return res;
 }

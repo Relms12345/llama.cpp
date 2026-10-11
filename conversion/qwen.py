@@ -268,6 +268,35 @@ class Qwen3Model(Qwen2Model):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("JinaForRanking")
+@ModelBase.example("jinaai/jina-reranker-v3.5")
+class JinaRerankerModel(Qwen3Model):
+    # Qwen3 backbone + projector (Linear -> ReLU -> Linear) applied to the hidden state of marker tokens;
+    # the listwise prompt and scoring are implemented in llama-server
+    model_arch = gguf.MODEL_ARCH.QWEN3
+
+    def _is_qwen3_reranker(self) -> bool:
+        return False
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_pooling_type(gguf.PoolingType.NONE)
+        self.gguf_writer.add_dense_activation("relu")
+        self.gguf_writer.add_string("jina.reranker.type", "v3.5-embed-match")
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("projector."):
+            if not name.endswith(".weight"):
+                raise ValueError(f"unexpected projector tensor {name!r}")
+            if name == "projector.0.weight":
+                self.gguf_writer.add_dense_features_dims("dense_2", data_torch.shape[1], data_torch.shape[0])
+            elif name == "projector.2.weight":
+                self.gguf_writer.add_dense_features_dims("dense_3", data_torch.shape[1], data_torch.shape[0])
+                self.gguf_writer.add_embedding_length_out(data_torch.shape[0])
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("Qwen3MoeForCausalLM")
 @ModelBase.example("Qwen/Qwen3-30B-A3B")
 class Qwen3MoeModel(Qwen2MoeModel):

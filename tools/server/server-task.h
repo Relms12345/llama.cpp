@@ -508,7 +508,6 @@ struct server_task_result_rerank : server_task_result {
     float score = -1e6;
 
     // jina-reranker-v3.5 listwise data; unused by ordinary rerankers
-    std::vector<float> scores;
     std::vector<float> jina_doc_embeddings;
     std::vector<float> jina_query_embedding;
     float jina_block_weight = 0.0f;
