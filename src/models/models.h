@@ -581,6 +581,7 @@ struct llama_model_qwen3 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    template <bool iswa>
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
     protected:
@@ -614,7 +615,7 @@ struct llama_model_vllm_decision2 : public llama_model_qwen3 {
 
     class input_decision;
 
-    struct graph : public llama_model_qwen3::graph {
+    struct graph : public llama_model_qwen3::graph<false> {
         graph(const llama_model & model, const llm_graph_params & params);
     private:
         // hidden: [n_embd, n_outputs], returns one score per option: [1, n_options]
