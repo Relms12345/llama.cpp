@@ -351,6 +351,12 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
         quantize &= name.compare(0, 9, "decision.") != 0;
     }
 
+    // the rank projector of jina-reranker is small and kept at its stored precision (F32),
+    // as the reference runs it unquantized
+    if (arch == LLM_ARCH_JINA_RERANKER) {
+        quantize &= name.compare(0, 10, "rank_proj.") != 0;
+    }
+
     // do not quantize RWKV's small yet 2D weights
     quantize &= name.find("time_mix_first.weight") == std::string::npos;
     quantize &= name.find("time_mix_w0.weight") == std::string::npos;

@@ -272,23 +272,44 @@ class Qwen3Model(Qwen2Model):
 @ModelBase.example("jinaai/jina-reranker-v3.5")
 class JinaRankerModel(Qwen3Model):
     """jina-reranker-v3.5: a Qwen3 backbone (with interleaved sliding-window attention)
-    scored listwise through <|embed_token|> / <|rerank_token|> hidden states.
+    scored listwise through <|embed_token|> / <|rerank_token|> hidden states, which a
+    projector (linear, ReLU, linear, no bias) maps to the ranking embeddings.
 
+    Written as its own arch so a GGUF without the projector cannot load as a plain Qwen3.
     The vocab path writes tokenizer.ggml.normalizer.nfc from tokenizer.json, which jina's
-    published GGUFs lack. The projector (projector.0/2.weight) is not written yet: llama
-    rejects unknown tensors until the qwen3 loader knows them."""
+    published GGUFs lack."""
 
-    model_arch = gguf.MODEL_ARCH.QWEN3
+    model_arch = gguf.MODEL_ARCH.JINA_RERANKER
+
+    _PROJECTOR = {
+        "projector.0.weight": gguf.MODEL_TENSOR.RANK_PROJ_IN,
+        "projector.2.weight": gguf.MODEL_TENSOR.RANK_PROJ_OUT,
+    }
 
     def _is_qwen3_reranker(self) -> bool:
         # not the Qwen3-Reranker yes/no head; the README's benchmark table names it
         return False
 
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        # TextModel drops "projector." as a multimodal tensor; here it is the ranking head
+        if item[0] in cls._PROJECTOR:
+            return item
+        if item[0].startswith("projector."):
+            raise ValueError(f"unexpected projector tensor {item[0]}")
+        return super().filter_tensors(item)
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        if name.startswith("projector."):
+        if name in self._PROJECTOR:
+            yield self.format_tensor_name(self._PROJECTOR[name], suffix=".weight"), data_torch
             return
         yield from super().modify_tensors(data_torch, name, bid)
 
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        # the reference runs the projector in float32 over the stored weights: F32 holds them exactly
+        if name in self._PROJECTOR:
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
 
 
 @ModelBase.register("Qwen3MoeForCausalLM")

@@ -627,6 +627,16 @@ struct llama_model_vllm_decision2 : public llama_model_qwen3 {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+// jina-reranker-v3.5 (JinaForRanking): Qwen3 with a rank projector (linear, ReLU, linear)
+// applied to the hidden states of the doc/query marker tokens
+struct llama_model_jina_reranker : public llama_model_qwen3 {
+    llama_model_jina_reranker(const struct llama_model_params & params) : llama_model_qwen3(params) {}
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    ggml_tensor * rank_proj_in  = nullptr; // [n_embd,        n_proj_hidden]
+    ggml_tensor * rank_proj_out = nullptr; // [n_proj_hidden, n_proj_out]
+};
+
 
 struct llama_model_qwen3moe : public llama_model_base {
     llama_model_qwen3moe(const struct llama_model_params & params) : llama_model_base(params) {}

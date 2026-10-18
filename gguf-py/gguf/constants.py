@@ -563,6 +563,7 @@ class MODEL_ARCH(IntEnum):
     QWEN35MOE        = auto()
     CLEF             = auto()
     VLLM_DECISION2   = auto()
+    JINA_RERANKER    = auto()
     QWEN4EXP         = auto()
     PHI2             = auto()
     PHI3             = auto()
@@ -932,6 +933,8 @@ class MODEL_TENSOR(IntEnum):
     DECISION_QUERY                = auto()
     DECISION_OPTION_MLP           = auto()
     DECISION_QUERY_MLP            = auto()
+    RANK_PROJ_IN                  = auto() # jina-reranker projector, linear 1
+    RANK_PROJ_OUT                 = auto() # jina-reranker projector, linear 2 (after ReLU)
     CONV1D               = auto()
     CONVNEXT_DW          = auto()
     CONVNEXT_NORM        = auto()
@@ -1353,6 +1356,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.QWEN35MOE:        "qwen35moe",
     MODEL_ARCH.CLEF:             "clef",
     MODEL_ARCH.VLLM_DECISION2:   "vllm-decision2",
+    MODEL_ARCH.JINA_RERANKER:    "jina-reranker",
     MODEL_ARCH.QWEN4EXP:         "qwen4exp",
     MODEL_ARCH.PHI2:             "phi2",
     MODEL_ARCH.PHI3:             "phi3",
@@ -1721,6 +1725,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DECISION_QUERY:                "decision.query",
     MODEL_TENSOR.DECISION_OPTION_MLP:           "decision.option_mlp",
     MODEL_TENSOR.DECISION_QUERY_MLP:            "decision.query_mlp",
+    MODEL_TENSOR.RANK_PROJ_IN:                  "rank_proj.in",
+    MODEL_TENSOR.RANK_PROJ_OUT:                 "rank_proj.out",
     MODEL_TENSOR.CONV1D:                    "conv1d",
     MODEL_TENSOR.CONVNEXT_DW:               "convnext.{bid}.dw",
     MODEL_TENSOR.CONVNEXT_NORM:             "convnext.{bid}.norm",
@@ -3071,6 +3077,25 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DECISION_OPTION_MLP,
         MODEL_TENSOR.DECISION_QUERY_MLP,
         MODEL_TENSOR.DECISION_SCORER_OUT,
+    ],
+    MODEL_ARCH.JINA_RERANKER: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        # rank projector
+        MODEL_TENSOR.RANK_PROJ_IN,
+        MODEL_TENSOR.RANK_PROJ_OUT,
     ],
     MODEL_ARCH.QWEN35MOE: [
         MODEL_TENSOR.TOKEN_EMBD,
