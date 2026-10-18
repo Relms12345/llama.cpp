@@ -18,6 +18,9 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
+    # Same nixpkgs as relms' system flake (../flake, input nixpkgs_2), so `system-rocm`
+    # builds with the exact toolchain and recipe of the system llama install.
+    nixpkgs-system.url = "github:Relms12345/nixpkgs/4caf539ccadc1da05b9c0e5b149cc148ccf38889";
   };
 
   # There's an optional binary cache available. The details are below, but they're commented out.
@@ -164,6 +167,29 @@
               }
               // lib.optionalAttrs (system == "x86_64-linux") {
                 rocm = config.legacyPackages.llamaPackagesRocm.llama-cpp;
+
+                # The system llama recipe with this tree as source: nixpkgs' llama-cpp
+                # (pkgsRocm, gfx1201) plus the ../flake modules/common/overlays.nix
+                # llama-cpp overrides. Builds of this output are directly comparable to
+                # the system install (the jina-rerank-harness baseline binary).
+                system-rocm =
+                  let
+                    pkgsSystem = import inputs.nixpkgs-system { inherit system; };
+                    base = pkgsSystem.pkgsRocm.llama-cpp.override { rocmGpuTargets = [ "gfx1201" ]; };
+                  in
+                  base.overrideAttrs (old: {
+                    version = "0.6.0-${self.rev or self.dirtyRev}";
+                    src = self;
+                    cmakeFlags =
+                      builtins.filter (flag: !(lib.hasPrefix "-DLLAMA_BUILD_EXAMPLES=" flag)) old.cmakeFlags
+                      ++ [
+                        (lib.cmakeBool "GGML_CUDA_FA_ALL_QUANTS" true)
+                        (lib.cmakeBool "LLAMA_BUILD_EXAMPLES" true)
+                      ];
+                    patches = [ ];
+                    npmDepsHash = "sha256-hqYzdp1FwPhYkBP278fQXgY9NCKB6Q3P6Gko7BfP0m0=";
+                    doCheck = false;
+                  });
               };
 
             # Packages exposed in `.#checks` will be built by the CI and by
