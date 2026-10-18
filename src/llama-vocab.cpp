@@ -26,6 +26,20 @@
 // helpers
 //
 
+// tokenizer.ggml.normalizer.nfc: NFC-normalize UTF-8 text; malformed UTF-8 is returned unchanged
+static std::string llama_normalize_nfc(const std::string & text) {
+    try {
+        std::string canonical;
+        canonical.reserve(text.size());
+        for (const uint32_t cpt : unicode_cpts_normalize_nfc(unicode_cpts_from_utf8(text))) {
+            canonical += unicode_cpt_to_utf8(cpt);
+        }
+        return canonical;
+    } catch (const std::invalid_argument &) {
+        return text;
+    }
+}
+
 struct naive_trie {
     naive_trie() : has_value(false), value(0) {
     }
@@ -630,7 +644,9 @@ struct llm_tokenizer_bpe_session {
 
     virtual void tokenize(const std::string & text, std::vector<llama_token> & output) {
         int final_prev_index = -1;
-        auto word_collection = unicode_regex_split(text, tokenizer.regex_exprs, tokenizer.byte_encode);
+        auto word_collection = vocab.get_normalizer_opts().nfc
+            ? unicode_regex_split(llama_normalize_nfc(text), tokenizer.regex_exprs, tokenizer.byte_encode)
+            : unicode_regex_split(text, tokenizer.regex_exprs, tokenizer.byte_encode);
 
         symbols_final.clear();
         auto tok_pre = vocab.get_pre_type();
@@ -1022,16 +1038,7 @@ struct llm_tokenizer_ugm_session {
         // normalize the input first
         std::string normalized;
         if (vocab.get_normalizer_opts().nfc) {
-            try {
-                std::string canonical;
-                for (const uint32_t cpt : unicode_cpts_normalize_nfc(unicode_cpts_from_utf8(text))) {
-                    canonical += unicode_cpt_to_utf8(cpt);
-                }
-                normalize(canonical, &normalized);
-            } catch (const std::invalid_argument &) {
-                // Use the existing UGM normalization path for malformed input.
-                normalize(text, &normalized);
-            }
+            normalize(llama_normalize_nfc(text), &normalized);
         } else {
             normalize(text, &normalized);
         }
