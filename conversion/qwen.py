@@ -268,6 +268,29 @@ class Qwen3Model(Qwen2Model):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("JinaForRanking")
+@ModelBase.example("jinaai/jina-reranker-v3.5")
+class JinaRankerModel(Qwen3Model):
+    """jina-reranker-v3.5: a Qwen3 backbone (with interleaved sliding-window attention)
+    scored listwise through <|embed_token|> / <|rerank_token|> hidden states.
+
+    The vocab path writes tokenizer.ggml.normalizer.nfc from tokenizer.json, which jina's
+    published GGUFs lack. The projector (projector.0/2.weight) is not written yet: llama
+    rejects unknown tensors until the qwen3 loader knows them."""
+
+    model_arch = gguf.MODEL_ARCH.QWEN3
+
+    def _is_qwen3_reranker(self) -> bool:
+        # not the Qwen3-Reranker yes/no head; the README's benchmark table names it
+        return False
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("projector."):
+            return
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
+
 @ModelBase.register("Qwen3MoeForCausalLM")
 @ModelBase.example("Qwen/Qwen3-30B-A3B")
 class Qwen3MoeModel(Qwen2MoeModel):
