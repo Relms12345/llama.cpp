@@ -148,6 +148,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "JinaBertForMaskedLM": "bert",
     "JinaBertModel": "bert",
     "JinaEmbeddingsV5Model": "bert",
+    "JinaForRanking": "qwen",
     "K2HorizonForCausalLM": "k2_horizon",
     "Kolibri1ForCausalLM": "kolibri1",
     "KORMoForCausalLM": "qwen",
