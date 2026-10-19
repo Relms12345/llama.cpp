@@ -628,13 +628,22 @@ struct llama_model_vllm_decision2 : public llama_model_qwen3 {
 };
 
 // jina-reranker-v3.5 (JinaForRanking): Qwen3 with a rank projector (linear, ReLU, linear)
-// applied to the hidden states of the doc/query marker tokens
+// applied to the hidden states of the doc/query marker tokens. In an embeddings context
+// every output row is projected: the output width is the projector's (n_embd_out)
 struct llama_model_jina_reranker : public llama_model_qwen3 {
     llama_model_jina_reranker(const struct llama_model_params & params) : llama_model_qwen3(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
     ggml_tensor * rank_proj_in  = nullptr; // [n_embd,        n_proj_hidden]
     ggml_tensor * rank_proj_out = nullptr; // [n_proj_hidden, n_proj_out]
+
+    template <bool iswa>
+    struct graph : public llama_model_qwen3::graph<iswa> {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
 
