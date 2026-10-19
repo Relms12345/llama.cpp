@@ -2,6 +2,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-decision.h"
+#include "server-rerank-list.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -951,7 +952,8 @@ public:
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
 
-    server_decision_context decision;
+    server_decision_context    decision;
+    server_rerank_list_context rerank_list;
 
     server_queue    queue_tasks;
     server_response queue_results;
@@ -1234,6 +1236,13 @@ private:
             decision.init(model_tgt);
         } catch (const std::exception & e) {
             SRV_ERR("failed to init decision model: %s\n", e.what());
+            return false;
+        }
+
+        try {
+            rerank_list.init(model_tgt, ctx_tgt);
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to init listwise reranker: %s\n", e.what());
             return false;
         }
 
@@ -2424,6 +2433,31 @@ private:
         res->id       = slot.task->id;
         res->index    = slot.task->index;
         res->n_tokens = slot.task->n_tokens();
+
+        if (!slot.task->rerank_markers.empty()) {
+            // listwise reranker: the vectors at the markers. can_split() is false for pooling none,
+            // so the whole prompt is in this batch and its outputs are the last prompt tokens
+            std::vector<int32_t> idx;
+            for (int i = 0; i < batch.size(); ++i) {
+                if (batch.tokens[i].output && batch.tokens[i].seq_id == slot.id) {
+                    idx.push_back(i);
+                }
+            }
+            const int32_t pos_first  = slot.prompt.n_tokens() - (int32_t) idx.size();
+            const int32_t n_embd_out = llama_model_n_embd_out(model_tgt);
+            for (const int32_t marker : slot.task->rerank_markers) {
+                const int32_t i = marker - pos_first;
+                const float * embd = i >= 0 && i < (int32_t) idx.size() ? llama_get_embeddings_ith(ctx_tgt, idx[i]) : nullptr;
+                if (embd == nullptr) {
+                    send_error(slot, "failed to get the embeddings at the rerank markers", ERROR_TYPE_SERVER);
+                    return;
+                }
+                res->embd.emplace_back(embd, embd + n_embd_out);
+            }
+
+            queue_results.send(std::move(res));
+            return;
+        }
 
         for (int i = 0; i < batch.size(); ++i) {
             if (!batch.tokens[i].output || batch.tokens[i].seq_id != slot.id) {
@@ -5692,6 +5726,9 @@ void server_routes::init_routes() {
 
     this->post_rerank = [this](const server_http_req & req) {
         auto res = create_response();
+        if (ctx_server.rerank_list.enabled) {
+            return handle_rerank_list(req, std::move(res));
+        }
         if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
             res->error(format_error_response("This server does not support reranking. Start it with `--reranking`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
@@ -6133,6 +6170,115 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
     json root = res_type == TASK_RESPONSE_TYPE_OAI_EMBD
         ? format_embeddings_response_oaicompat(body, meta->model_name, responses, use_base64)
         : json(responses);
+    res->ok(root);
+    return res;
+}
+
+// listwise reranker (server-rerank-list.h): the documents share prompts, one task per block
+std::unique_ptr<server_res_generator> server_routes::handle_rerank_list(const server_http_req & req, std::unique_ptr<server_res_generator> res) {
+    // the vectors are read per token: an embeddings context without pooling
+    // (a chat context would also hold the logits of every prompt token)
+    if (!params.embedding || !ctx_server.rerank_list.unpooled) {
+        res->error(format_error_response("This model ranks the documents of a request together. Start the server with `--embedding --pooling none` (not `--reranking`)", ERROR_TYPE_NOT_SUPPORTED));
+        return res;
+    }
+
+    const json body = json::parse(req.body);
+
+    // TEI format if "texts" is given, see post_rerank
+    const bool is_tei_format = body.contains("texts");
+
+    if (!body.contains("query") || !body.at("query").is_string()) {
+        res->error(format_error_response("\"query\" must be a string", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    const std::string query = body.at("query");
+
+    std::vector<std::string> documents = json_value(body, "documents",
+                                         json_value(body, "texts", std::vector<std::string>()));
+    if (documents.empty()) {
+        res->error(format_error_response("\"documents\" must be a non-empty string array", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    const int         top_n         = json_value(body, "top_n", (int) documents.size());
+    const std::string instruction   = json_value(body, "instruction", std::string());
+    const bool        return_blocks = json_value(body, "return_blocks", false);
+
+    std::vector<server_rerank_list_block> blocks;
+    try {
+        blocks = ctx_server.rerank_list.make_blocks(query, documents, instruction);
+    } catch (const std::invalid_argument & e) {
+        res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    auto & rd = res->rd;
+    {
+        std::vector<server_task> tasks;
+        tasks.reserve(blocks.size());
+        for (const auto & block : blocks) {
+            server_task task = server_task(SERVER_TASK_TYPE_RERANK);
+            task.id             = rd.get_new_id();
+            task.tokens         = server_tokens(block.tokens, false);
+            task.rerank_markers = block.markers;
+            tasks.push_back(std::move(task));
+        }
+        rd.post_tasks(std::move(tasks));
+    }
+
+    auto all_results = rd.wait_for_all(req.should_stop);
+    if (all_results.is_terminated) {
+        return res; // connection is closed
+    } else if (all_results.error) {
+        res->error(all_results.error->to_json());
+        return res;
+    }
+
+    std::vector<std::vector<std::vector<float>>> vectors;
+    vectors.reserve(blocks.size());
+    for (size_t b = 0; b < blocks.size(); b++) {
+        auto * result = dynamic_cast<server_task_result_rerank *>(all_results.results[b].get());
+        GGML_ASSERT(result != nullptr && result->embd.size() == blocks[b].markers.size());
+        vectors.push_back(std::move(result->embd));
+    }
+
+    std::vector<double> weights;
+    const std::vector<double> scores = server_rerank_list_context::score(blocks, vectors, documents.size(), weights);
+
+    // one entry per document; the tokens of a block are counted once, at its first document
+    json ranks = json::array();
+    for (const auto & block : blocks) {
+        for (size_t d = 0; d < block.docs.size(); d++) {
+            ranks.push_back(json{
+                {"index",            block.docs[d]},
+                {"score",            scores[block.docs[d]]},
+                {"tokens_evaluated", d == 0 ? (int32_t) block.tokens.size() : 0},
+            });
+        }
+    }
+
+    json root = format_response_rerank(body, meta->model_name, ranks, is_tei_format, documents, top_n);
+
+    if (return_blocks && !is_tei_format) {
+        json out = json::array();
+        for (size_t b = 0; b < blocks.size(); b++) {
+            json doc_vectors = json::array();
+            for (size_t d = 0; d < blocks[b].docs.size(); d++) {
+                doc_vectors.push_back(vectors[b][1 + d]);
+            }
+            out.push_back(json{
+                {"docs",        blocks[b].docs},
+                {"prompt",      blocks[b].prompt},
+                {"tokens",      blocks[b].tokens},
+                {"weight",      weights[b]},
+                {"query",       vectors[b].back()},
+                {"doc_vectors", std::move(doc_vectors)},
+            });
+        }
+        root["blocks"] = std::move(out);
+    }
+
     res->ok(root);
     return res;
 }

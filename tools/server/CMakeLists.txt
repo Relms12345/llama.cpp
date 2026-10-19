@@ -15,6 +15,8 @@ add_library(${TARGET} STATIC
     server-common.h
     server-decision.cpp
     server-decision.h
+    server-rerank-list.cpp
+    server-rerank-list.h
     server-context.cpp
     server-context.h
     server-stream.cpp

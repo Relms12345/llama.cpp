@@ -206,6 +206,10 @@ struct server_task {
     };
     decision decision;
 
+    // used by SERVER_TASK_TYPE_RERANK of a listwise reranker (server-rerank-list.h):
+    // the result holds the embeddings at these prompt positions instead of a score
+    std::vector<int32_t> rerank_markers;
+
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
 
@@ -511,6 +515,8 @@ struct server_task_result_embd : server_task_result {
 
 struct server_task_result_rerank : server_task_result {
     float score = -1e6;
+
+    std::vector<std::vector<float>> embd; // listwise reranker: one vector per marker of the task
 
     int32_t n_tokens;
 
