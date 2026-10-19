@@ -281,6 +281,9 @@ struct server_slot {
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
+    // listwise reranker: the vectors at the markers of the task, collected batch by batch
+    std::vector<std::vector<float>> rerank_embd;
+
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
 
@@ -388,6 +391,7 @@ struct server_slot {
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
+        rerank_embd.clear();
 
         if (can_speculate()) {
             spec_draft.clear();
@@ -458,6 +462,10 @@ struct server_slot {
         // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
         if (!llama_get_memory(ctx_tgt)) {
             return false;
+        }
+        // a listwise reranker collects its vectors from every batch, see collect_rerank_markers()
+        if (task->type == SERVER_TASK_TYPE_RERANK && !task->rerank_markers.empty() && llama_get_causal_attn(ctx_tgt)) {
+            return true;
         }
         // context can be chunked/split if the pooling type is LAST
         const auto pooling = llama_pooling_type(ctx_tgt);
@@ -2428,6 +2436,23 @@ private:
         queue_results.send(std::move(res));
     }
 
+    // listwise reranker: keep the vectors of the markers that are in this batch
+    void collect_rerank_markers(server_slot & slot, const common_batch & batch) {
+        const auto &  markers    = slot.task->rerank_markers;
+        const int32_t n_embd_out = llama_model_n_embd_out(model_tgt);
+        for (int i = 0; i < batch.size() && slot.rerank_embd.size() < markers.size(); ++i) {
+            const auto & tok = batch.tokens[i];
+            if (!tok.output || tok.seq_id != slot.id || tok.pos[0] != markers[slot.rerank_embd.size()]) {
+                continue;
+            }
+            const float * embd = llama_get_embeddings_ith(ctx_tgt, i);
+            if (embd == nullptr) {
+                return; // send_rerank() reports the missing vectors
+            }
+            slot.rerank_embd.emplace_back(embd, embd + n_embd_out);
+        }
+    }
+
     void send_rerank(const server_slot & slot, const common_batch & batch) {
         auto res = std::make_unique<server_task_result_rerank>();
         res->id       = slot.task->id;
@@ -2435,25 +2460,12 @@ private:
         res->n_tokens = slot.task->n_tokens();
 
         if (!slot.task->rerank_markers.empty()) {
-            // listwise reranker: the vectors at the markers. can_split() is false for pooling none,
-            // so the whole prompt is in this batch and its outputs are the last prompt tokens
-            std::vector<int32_t> idx;
-            for (int i = 0; i < batch.size(); ++i) {
-                if (batch.tokens[i].output && batch.tokens[i].seq_id == slot.id) {
-                    idx.push_back(i);
-                }
+            // listwise reranker: the vectors collected at the markers
+            if (slot.rerank_embd.size() != slot.task->rerank_markers.size()) {
+                send_error(slot, "failed to get the embeddings at the rerank markers", ERROR_TYPE_SERVER);
+                return;
             }
-            const int32_t pos_first  = slot.prompt.n_tokens() - (int32_t) idx.size();
-            const int32_t n_embd_out = llama_model_n_embd_out(model_tgt);
-            for (const int32_t marker : slot.task->rerank_markers) {
-                const int32_t i = marker - pos_first;
-                const float * embd = i >= 0 && i < (int32_t) idx.size() ? llama_get_embeddings_ith(ctx_tgt, idx[i]) : nullptr;
-                if (embd == nullptr) {
-                    send_error(slot, "failed to get the embeddings at the rerank markers", ERROR_TYPE_SERVER);
-                    return;
-                }
-                res->embd.emplace_back(embd, embd + n_embd_out);
-            }
+            res->embd = slot.rerank_embd;
 
             queue_results.send(std::move(res));
             return;
@@ -4347,6 +4359,12 @@ private:
                 if (slot.task->params.stream && slot.task->params.return_progress) {
                     send_partial_response(slot, {}, true);
                 }
+            }
+
+            // a listwise reranker reads its markers from every batch of its prompt
+            if ((slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) &&
+                slot.task->type == SERVER_TASK_TYPE_RERANK && !slot.task->rerank_markers.empty()) {
+                collect_rerank_markers(slot, batch.view);
             }
 
             if (!is_inside_view(slot.i_batch)) {
