@@ -491,6 +491,12 @@ struct server_slot {
             return false;
         }
 
+        // a listwise reranker prompt is chunked exactly as when it runs alone: sharing a batch
+        // would shift its ubatch boundaries, and its scores would depend on concurrent requests
+        if (!task->rerank_markers.empty() || !other_slot.task->rerank_markers.empty()) {
+            return false;
+        }
+
         return task->type == other_slot.task->type
             && inp_embd.size() == other_slot.inp_embd.size()
             && are_lora_equal(lora, other_slot.lora);
