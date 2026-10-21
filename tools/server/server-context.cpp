@@ -1254,7 +1254,10 @@ private:
         }
 
         try {
-            rerank_list.init(model_tgt, ctx_tgt);
+            rerank_list.init(model_tgt, ctx_tgt, params_base.rerank_block_size);
+            if (rerank_list.enabled) {
+                SRV_INF("listwise reranker: up to %zu documents per block\n", rerank_list.block_size);
+            }
         } catch (const std::exception & e) {
             SRV_ERR("failed to init listwise reranker: %s\n", e.what());
             return false;

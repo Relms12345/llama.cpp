@@ -3509,6 +3509,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RERANKING"));
     add_opt(common_arg(
+        {"--rerank-block-size"}, "N",
+        string_format("listwise reranker (jina-reranker arch): max documents per prompt block, 1 to 125 (default: %d, jina's packing);\n"
+            "smaller blocks are faster for requests with more documents than N, but change the scores", params.rerank_block_size),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 125) {
+                throw std::invalid_argument("--rerank-block-size must be between 1 and 125");
+            }
+            params.rerank_block_size = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RERANK_BLOCK_SIZE"));
+    add_opt(common_arg(
         {"--api-key"}, "KEY",
         "API key to use for authentication, multiple keys can be provided as a comma-separated list (default: none)",
         [](common_params & params, const std::string & value) {

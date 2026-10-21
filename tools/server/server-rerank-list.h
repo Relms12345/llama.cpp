@@ -18,11 +18,12 @@ struct server_rerank_list_block {
 };
 
 struct server_rerank_list_context {
-    bool enabled  = false;
-    bool unpooled = false; // the context has no pooling, so the vectors can be read per token
+    bool   enabled    = false;
+    bool   unpooled   = false; // the context has no pooling, so the vectors can be read per token
+    size_t block_size = 0;     // max documents per block (jina: 125)
 
-    // enabled for the jina-reranker arch, throws if the vocab lacks its marker tokens
-    void init(const llama_model * model, const llama_context * ctx);
+    // enabled for the jina-reranker arch, throws if the vocab lacks its marker tokens or block_size is not 1 to 125
+    void init(const llama_model * model, const llama_context * ctx, int32_t block_size);
 
     // truncate the query and the documents, pack the documents into blocks, render and tokenize their prompts
     // throws std::invalid_argument if a prompt does not carry exactly its markers
