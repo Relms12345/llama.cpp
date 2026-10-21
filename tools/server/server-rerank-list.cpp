@@ -10,7 +10,7 @@ static const int64_t RERANK_LIST_MAX_DOC        = 8192;
 static const int64_t RERANK_LIST_DOC_RESERVE    = 1;
 static const int64_t RERANK_LIST_MAX_QUERY      = 2048;
 static const int64_t RERANK_LIST_QUERY_RESERVE  = 64;     // prompt scaffolding
-static const size_t  RERANK_LIST_BLOCK_SIZE     = 125;
+static const int32_t RERANK_LIST_BLOCK_SIZE     = 125;    // the most documents per block; smaller is a server option
 static const double  RERANK_LIST_EPS            = 1e-8;
 
 static const char * RERANK_LIST_DOC_TOKEN   = "<|embed_token|>";
@@ -118,12 +118,16 @@ static std::string rerank_list_prompt(
     return RERANK_LIST_SYSTEM + body + RERANK_LIST_SUFFIX;
 }
 
-void server_rerank_list_context::init(const llama_model * model, const llama_context * ctx) {
+void server_rerank_list_context::init(const llama_model * model, const llama_context * ctx, int32_t n_block) {
     *this = server_rerank_list_context(); // the model can be reloaded
 
     char arch[64];
     if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) < 0 || std::string(arch) != "jina-reranker") {
         return;
+    }
+
+    if (n_block < 1 || n_block > RERANK_LIST_BLOCK_SIZE) {
+        throw std::runtime_error(string_format("listwise reranker: block size %d is not 1 to %d", n_block, RERANK_LIST_BLOCK_SIZE));
     }
 
     vocab = llama_model_get_vocab(model);
@@ -138,8 +142,9 @@ void server_rerank_list_context::init(const llama_model * model, const llama_con
     token_doc   = single_token(RERANK_LIST_DOC_TOKEN);
     token_query = single_token(RERANK_LIST_QUERY_TOKEN);
 
-    unpooled = llama_pooling_type(ctx) == LLAMA_POOLING_TYPE_NONE;
-    enabled  = true;
+    unpooled   = llama_pooling_type(ctx) == LLAMA_POOLING_TYPE_NONE;
+    block_size = (size_t) n_block;
+    enabled    = true;
 }
 
 std::string server_rerank_list_context::truncate(const std::string & text, size_t max_tokens, size_t & n_tokens) const {
@@ -182,7 +187,7 @@ std::vector<server_rerank_list_block> server_rerank_list_context::make_blocks(
         capacity -= lengths[i];
         n_cur    += lengths[i];
 
-        if (cur.docs.size() >= RERANK_LIST_BLOCK_SIZE ||
+        if (cur.docs.size() >= block_size ||
             capacity < RERANK_LIST_MAX_DOC ||
             n_cur >= RERANK_LIST_MAX_LENGTH - RERANK_LIST_MAX_DOC) {
             blocks.push_back(std::move(cur));
