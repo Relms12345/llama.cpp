@@ -178,7 +178,7 @@
                     base = pkgsSystem.pkgsRocm.llama-cpp.override { rocmGpuTargets = [ "gfx1201" ]; };
                   in
                   base.overrideAttrs (old: {
-                    version = "0.6.0-${self.rev or self.dirtyRev}";
+                    version = "0.7.0-${self.rev or self.dirtyRev}";
                     src = self;
                     cmakeFlags =
                       builtins.filter (flag: !(lib.hasPrefix "-DLLAMA_BUILD_EXAMPLES=" flag)) old.cmakeFlags
