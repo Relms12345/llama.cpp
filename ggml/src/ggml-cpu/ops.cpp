@@ -9922,10 +9922,14 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     };
     const bool kv_is_tileable = is_tileable(k, DK) && is_tileable(v, DV);
     // the split-KV decode path uses the generic one_chunk kernel, which supports any K/V type
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_tileable && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    // (mixed K/V types only with a quantized V, which takes the grouped decode kernel below)
+    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_tileable && q->type == GGML_TYPE_F32 && nek1 >= 512 &&
+                                   (k->type == v->type || ggml_is_quantized(v->type));
 
-    // decode with grouped-query attention: process the q heads of a K/V head together (same results as one_chunk)
-    const bool use_gqa = !use_ref && neq1 == 1 && q->type == GGML_TYPE_F32 && nek2 > 0 && neq2/nek2 > 1;
+    // decode with grouped-query attention: process the q heads of a K/V head together (same results as one_chunk).
+    // The gain is the V dequantization done once per group: with F16/F32 V the per-head kernel is as fast (measured).
+    const bool use_gqa = !use_ref && neq1 == 1 && q->type == GGML_TYPE_F32 && nek2 > 0 && neq2/nek2 > 1 &&
+                         ggml_is_quantized(v->type);
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9979,13 +9983,15 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             nchunk = nth;
         }
 
-        if (use_gqa) {
-            // chunks of whole K/V head groups (split further only if there are fewer groups than threads)
+        if (use_gqa && !disable_chunking) {
+            // chunks of whole K/V head groups, only with enough groups to balance the threads
+            // (otherwise keep the per-head chunks, the kernel still groups the heads within a chunk)
             const int64_t rk2     = neq2/nek2;
             const int64_t ngroups = nr/rk2;
-            const int64_t nsplit  = ngroups >= nth ? 1 : (nth + ngroups - 1)/ngroups;
-            chunk_size = (std::min<int64_t>(rk2, GGML_FA_GQA_MAX) + nsplit - 1)/nsplit;
-            nchunk     = (nr + chunk_size - 1)/chunk_size;
+            if (ngroups >= 4*nth) {
+                chunk_size = std::min<int64_t>(rk2, GGML_FA_GQA_MAX);
+                nchunk     = (nr + chunk_size - 1)/chunk_size;
+            }
         }
 
         if (ith == 0) {
