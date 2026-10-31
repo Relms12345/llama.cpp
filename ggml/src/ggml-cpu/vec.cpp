@@ -137,13 +137,69 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
 }
 
 void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * GGML_RESTRICT x, size_t bx, ggml_bf16_t * GGML_RESTRICT y, size_t by, int nrc) {
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+    assert((nrc == 2) || (nrc == 1));
+#else
     assert(nrc == 1);
+#endif
     GGML_UNUSED(nrc);
     GGML_UNUSED(bx);
     GGML_UNUSED(by);
     GGML_UNUSED(bs);
     int i = 0;
     ggml_float sumf = 0;
+
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+    if (nrc == 2) {
+        // 2x2 tile: s[0] = x0.y0, s[1] = x1.y0, s[bs] = x0.y1, s[bs + 1] = x1.y1
+        // BFMMLA multiplies a 2x4 by a 4x2 bf16 matrix, so the rows are interleaved in groups of 4
+        const bfloat16_t * x0 = (const bfloat16_t *) x;
+        const bfloat16_t * x1 = (const bfloat16_t *) ((const char *) x + bx);
+        const bfloat16_t * y0 = (const bfloat16_t *) y;
+        const bfloat16_t * y1 = (const bfloat16_t *) ((const char *) y + by);
+
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        for (; i + 16 <= n; i += 16) {
+            const bfloat16x8_t a00 = vld1q_bf16(x0 + i);
+            const bfloat16x8_t a01 = vld1q_bf16(x0 + i + 8);
+            const bfloat16x8_t a10 = vld1q_bf16(x1 + i);
+            const bfloat16x8_t a11 = vld1q_bf16(x1 + i + 8);
+            const bfloat16x8_t b00 = vld1q_bf16(y0 + i);
+            const bfloat16x8_t b01 = vld1q_bf16(y0 + i + 8);
+            const bfloat16x8_t b10 = vld1q_bf16(y1 + i);
+            const bfloat16x8_t b11 = vld1q_bf16(y1 + i + 8);
+
+#define ZIP1_BF16(a, b) vreinterpretq_bf16_u64(vzip1q_u64(vreinterpretq_u64_bf16(a), vreinterpretq_u64_bf16(b)))
+#define ZIP2_BF16(a, b) vreinterpretq_bf16_u64(vzip2q_u64(vreinterpretq_u64_bf16(a), vreinterpretq_u64_bf16(b)))
+            acc0 = vbfmmlaq_f32(acc0, ZIP1_BF16(a00, a10), ZIP1_BF16(b00, b10));
+            acc1 = vbfmmlaq_f32(acc1, ZIP2_BF16(a00, a10), ZIP2_BF16(b00, b10));
+            acc0 = vbfmmlaq_f32(acc0, ZIP1_BF16(a01, a11), ZIP1_BF16(b01, b11));
+            acc1 = vbfmmlaq_f32(acc1, ZIP2_BF16(a01, a11), ZIP2_BF16(b01, b11));
+#undef ZIP1_BF16
+#undef ZIP2_BF16
+        }
+        // acc = [x0.y0, x0.y1, x1.y0, x1.y1]
+        const float32x4_t acc = vaddq_f32(acc0, acc1);
+        float r00 = vgetq_lane_f32(acc, 0);
+        float r01 = vgetq_lane_f32(acc, 1);
+        float r10 = vgetq_lane_f32(acc, 2);
+        float r11 = vgetq_lane_f32(acc, 3);
+        for (; i < n; ++i) {
+            const float fx0 = GGML_BF16_TO_FP32(x[i]);
+            const float fx1 = GGML_BF16_TO_FP32(((const ggml_bf16_t *) ((const char *) x + bx))[i]);
+            const float fy0 = GGML_BF16_TO_FP32(y[i]);
+            const float fy1 = GGML_BF16_TO_FP32(((const ggml_bf16_t *) ((const char *) y + by))[i]);
+            r00 += fx0*fy0; r01 += fx0*fy1;
+            r10 += fx1*fy0; r11 += fx1*fy1;
+        }
+        s[0]      = r00;
+        s[1]      = r10;
+        s[bs]     = r01;
+        s[bs + 1] = r11;
+        return;
+    }
+#endif
 
 #if defined(__AVX512BF16__)
     __m512 c1 = _mm512_setzero_ps();
@@ -195,6 +251,44 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
     sumf += (ggml_float)_mm_cvtss_f32(g);
 
 #undef LOAD
+#elif defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+    // BFMLALB/BFMLALT: IEEE fused widening multiply-add of the even/odd bf16 lanes
+    float32x4_t c1 = vdupq_n_f32(0.0f);
+    float32x4_t c2 = vdupq_n_f32(0.0f);
+    float32x4_t c3 = vdupq_n_f32(0.0f);
+    float32x4_t c4 = vdupq_n_f32(0.0f);
+    for (; i + 16 <= n; i += 16) {
+        const bfloat16x8_t a0 = vld1q_bf16((const bfloat16_t *) (x + i));
+        const bfloat16x8_t b0 = vld1q_bf16((const bfloat16_t *) (y + i));
+        const bfloat16x8_t a1 = vld1q_bf16((const bfloat16_t *) (x + i + 8));
+        const bfloat16x8_t b1 = vld1q_bf16((const bfloat16_t *) (y + i + 8));
+        c1 = vbfmlalbq_f32(c1, a0, b0);
+        c2 = vbfmlaltq_f32(c2, a0, b0);
+        c3 = vbfmlalbq_f32(c3, a1, b1);
+        c4 = vbfmlaltq_f32(c4, a1, b1);
+    }
+    sumf += (ggml_float)vaddvq_f32(vaddq_f32(vaddq_f32(c1, c2), vaddq_f32(c3, c4)));
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    // widen bf16 -> fp32 (shift into the upper half) and FMA
+#define LOAD_LO(p) vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16 (p), 16))
+#define LOAD_HI(p) vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(p), 16))
+    float32x4_t c1 = vdupq_n_f32(0.0f);
+    float32x4_t c2 = vdupq_n_f32(0.0f);
+    float32x4_t c3 = vdupq_n_f32(0.0f);
+    float32x4_t c4 = vdupq_n_f32(0.0f);
+    for (; i + 16 <= n; i += 16) {
+        const uint16x8_t a0 = vld1q_u16((const uint16_t *) (x + i));
+        const uint16x8_t b0 = vld1q_u16((const uint16_t *) (y + i));
+        const uint16x8_t a1 = vld1q_u16((const uint16_t *) (x + i + 8));
+        const uint16x8_t b1 = vld1q_u16((const uint16_t *) (y + i + 8));
+        c1 = vfmaq_f32(c1, LOAD_LO(a0), LOAD_LO(b0));
+        c2 = vfmaq_f32(c2, LOAD_HI(a0), LOAD_HI(b0));
+        c3 = vfmaq_f32(c3, LOAD_LO(a1), LOAD_LO(b1));
+        c4 = vfmaq_f32(c4, LOAD_HI(a1), LOAD_HI(b1));
+    }
+    sumf += (ggml_float)vaddvq_f32(vaddq_f32(vaddq_f32(c1, c2), vaddq_f32(c3, c4)));
+#undef LOAD_LO
+#undef LOAD_HI
 #elif defined(__riscv_v_intrinsic) && defined(__riscv_zvfbfwma)
     size_t vl = __riscv_vsetvlmax_e32m4();
 

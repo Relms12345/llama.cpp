@@ -405,7 +405,11 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_bf16,
         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_bf16,
         .vec_dot_type             = GGML_TYPE_BF16,
+#if defined (__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+        .nrows                    = 2,
+#else
         .nrows                    = 1,
+#endif
     },
     [GGML_TYPE_TQ1_0] = {
         .from_float               = quantize_row_tq1_0,
@@ -3782,6 +3786,22 @@ void ggml_cpu_fp16_to_fp32(const ggml_fp16_t * x, float * y, int64_t n) {
 
 void ggml_cpu_fp32_to_bf16(const float * x, ggml_bf16_t * y, int64_t n) {
     int64_t i = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    // bit exact vectorization of ggml_compute_fp32_to_bf16 (round to nearest even, quiet NaN)
+    const uint32x4_t abs_mask = vdupq_n_u32(0x7fffffff);
+    const uint32x4_t inf      = vdupq_n_u32(0x7f800000);
+    const uint32x4_t bias     = vdupq_n_u32(0x7fff);
+    const uint32x4_t one      = vdupq_n_u32(1);
+    const uint16x4_t qnan     = vdup_n_u16(64);
+    for (; i + 4 <= n; i += 4) {
+        const uint32x4_t u     = vreinterpretq_u32_f32(vld1q_f32(x + i));
+        const uint32x4_t rnd   = vaddq_u32(u, vaddq_u32(bias, vandq_u32(vshrq_n_u32(u, 16), one)));
+        const uint16x4_t r     = vshrn_n_u32(rnd, 16);
+        const uint16x4_t nan   = vorr_u16(vshrn_n_u32(u, 16), qnan);
+        const uint16x4_t isnan = vmovn_u32(vcgtq_u32(vandq_u32(u, abs_mask), inf));
+        vst1_u16((uint16_t *) (y + i), vbsl_u16(isnan, nan, r));
+    }
+#endif
     for (; i < n; ++i) {
         y[i] = GGML_FP32_TO_BF16(x[i]);
     }
