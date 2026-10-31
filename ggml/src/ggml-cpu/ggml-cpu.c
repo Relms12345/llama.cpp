@@ -3194,6 +3194,8 @@ struct ggml_cplan ggml_graph_plan(
                         // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
                         size_t n_chunks = n_tasks;
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
+                        // grouped (GQA) decode kernel scratch, placed after the partials
+                        decode += sizeof(float)*(2*n_tasks*(CACHE_LINE_SIZE/sizeof(float)) + n_tasks*GGML_FA_GQA_SCRATCH(DK, DV));
 
                         cur += MAX(prefill, decode);
                     } break;
