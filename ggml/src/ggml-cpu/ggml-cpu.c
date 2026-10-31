@@ -3260,6 +3260,79 @@ struct ggml_cplan ggml_graph_plan(
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 
+//
+// MoE expert prefetch (GGML_CPU_MOE_PREFETCH=1)
+//
+// When the weights of a MoE model are not resident (mmap'ed model larger than the RAM,
+// or anonymous memory that was swapped out, e.g. to zram), every expert is faulted in
+// page by page while the matmul runs. As soon as the router has selected the experts,
+// hint the kernel to read the slices of all the MUL_MAT_IDs that share these ids
+// (gate, up and down) so the I/O is issued in bulk and overlaps with the compute.
+// Opt-in: for resident weights the hints are pure syscall overhead.
+//
+static bool ggml_cpu_moe_prefetch = false;
+
+#if (defined(__linux__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
+#include <sys/mman.h>
+
+static void ggml_cpu_prefetch_moe_experts(const struct ggml_cgraph * cgraph, int node_n) {
+    const struct ggml_tensor * node = cgraph->nodes[node_n];
+    const struct ggml_tensor * ids  = node->src[2];
+
+    // only once per set of ids: skip if an earlier MUL_MAT_ID used the same ids
+    for (int j = node_n - 1; j >= 0 && j >= node_n - 32; j--) {
+        if (cgraph->nodes[j]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[j]->src[2] == ids) {
+            return;
+        }
+    }
+
+    enum { MAX_EXPERTS = 1024 };
+    const int64_t n_as = node->src[0]->ne[2];
+    if (n_as > MAX_EXPERTS || ids->type != GGML_TYPE_I32) {
+        return;
+    }
+    uint64_t used[MAX_EXPERTS/64] = { 0 };
+    for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
+        for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + i1*ids->nb[1] + i0*ids->nb[0]);
+            if (e >= 0 && e < n_as) {
+                used[e/64] |= 1ull << (e%64);
+            }
+        }
+    }
+
+    static long page_size = 0;
+    if (page_size == 0) {
+        page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0) {
+            page_size = 4096;
+        }
+    }
+
+    for (int j = node_n; j < cgraph->n_nodes && j < node_n + 32; j++) {
+        const struct ggml_tensor * t = cgraph->nodes[j];
+        if (t->op != GGML_OP_MUL_MAT_ID || t->src[2] != ids) {
+            continue;
+        }
+        const struct ggml_tensor * w = t->src[0];
+        for (int64_t e = 0; e < w->ne[2] && e < n_as; e++) {
+            if (!(used[e/64] & (1ull << (e%64)))) {
+                continue;
+            }
+            const uintptr_t beg = (uintptr_t) w->data + (uintptr_t) (e*w->nb[2]);
+            const uintptr_t end = beg + (uintptr_t) w->nb[2];
+            const uintptr_t beg_page = beg & ~((uintptr_t) page_size - 1);
+            madvise((void *) beg_page, end - beg_page, MADV_WILLNEED);
+        }
+    }
+}
+#else
+static void ggml_cpu_prefetch_moe_experts(const struct ggml_cgraph * cgraph, int node_n) {
+    GGML_UNUSED(cgraph);
+    GGML_UNUSED(node_n);
+}
+#endif
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -3372,6 +3445,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+
+        if (ggml_cpu_moe_prefetch && node->op == GGML_OP_MUL_MAT_ID && state->ith == 0) {
+            ggml_cpu_prefetch_moe_experts(cgraph, node_n);
         }
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
@@ -4191,6 +4268,11 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+        }
+
+        {
+            const char * env = getenv("GGML_CPU_MOE_PREFETCH");
+            ggml_cpu_moe_prefetch = (env != NULL && atoi(env) == 1);
         }
 
         is_first_call = false;
