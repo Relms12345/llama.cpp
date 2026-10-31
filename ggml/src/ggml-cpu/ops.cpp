@@ -8765,6 +8765,102 @@ void ggml_compute_forward_argsort(
     }
 }
 
+
+// Fused MoE router. Every step reproduces the arithmetic of the corresponding CPU op
+// (soft_max, sigmoid, add, argsort, get_rows, sum_rows, clamp, div, scale), so the selected
+// experts and their weights are identical to the unfused graph.
+void ggml_compute_forward_moe_router_fused(const ggml_compute_params * params, const ggml_moe_router_args * a) {
+    const ggml_tensor * logits = a->logits;
+    const int64_t n_expert = logits->ne[0];
+    const int64_t n_tokens = ggml_nrows(logits);
+    const int     k        = a->n_used;
+
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && logits->nb[0] == sizeof(float));
+    GGML_ASSERT(n_expert <= GGML_MOE_ROUTER_MAX_EXPERTS && k <= n_expert);
+
+    const ggml_tensor * w = a->weights;
+    // element (j, t) of the weights, [1, k, T] or [k, T]
+    const size_t w_nbj = w->ne[0] == 1 ? w->nb[1] : w->nb[0];
+    const size_t w_nbt = w->ne[0] == 1 ? w->nb[2] : w->nb[1];
+
+    float probs[GGML_MOE_ROUTER_MAX_EXPERTS];
+    float sel  [GGML_MOE_ROUTER_MAX_EXPERTS];
+    float wsel [GGML_MOE_ROUTER_MAX_EXPERTS];
+    float xrow [GGML_MOE_ROUTER_MAX_EXPERTS];
+
+    for (int64_t t = params->ith; t < n_tokens; t += params->nth) {
+        // the outputs may reuse the memory of the logits (single row, see ggml_cpu_try_fuse_moe_router):
+        // read the whole row before writing anything
+        memcpy(xrow, (const char *) logits->data + t*logits->nb[1], n_expert*sizeof(float));
+        const float * x   = xrow;
+        int32_t     * ids = (int32_t *) ((char *) a->argsort->data + t*a->argsort->nb[1]);
+
+        const float * sort_src = x;
+        if (a->gating == GGML_MOE_ROUTER_SOFTMAX) {
+            // soft_max_f32 without mask and sinks
+            ggml_vec_cpy_f32  (n_expert, sel, x);
+            ggml_vec_scale_f32(n_expert, sel, a->softmax_scale);
+            float max = -INFINITY;
+            ggml_vec_max_f32(n_expert, &max, sel);
+            ggml_float sum = ggml_vec_soft_max_f32(n_expert, probs, sel, max);
+            sum = 1.0/sum;
+            ggml_vec_scale_f32(n_expert, probs, sum);
+            sort_src = probs;
+        } else if (a->gating == GGML_MOE_ROUTER_SIGMOID) {
+            for (int64_t e = 0; e < n_expert; ++e) {
+                probs[e] = 1.f / (1.f + expf(-x[e]));
+            }
+            sort_src = probs;
+        }
+        if (a->bias) {
+            const float * b = (const float *) a->bias->data;
+            for (int64_t e = 0; e < n_expert; ++e) {
+                sel[e] = sort_src[e] + b[e];
+            }
+            sort_src = sel;
+        }
+
+        for (int64_t e = 0; e < n_expert; ++e) {
+            ids[e] = e;
+        }
+        std::sort(ids, ids + n_expert, cmp_argsort<GGML_SORT_ORDER_DESC>{sort_src});
+
+        if (a->gating == GGML_MOE_ROUTER_DELAYED_SOFTMAX) {
+            // get_rows of the logits, soft_max_f32 over the selected experts
+            for (int j = 0; j < k; ++j) {
+                sel[j] = x[ids[j]];
+            }
+            ggml_vec_scale_f32(k, sel, a->softmax_scale);
+            float max = -INFINITY;
+            ggml_vec_max_f32(k, &max, sel);
+            ggml_float sum = ggml_vec_soft_max_f32(k, wsel, sel, max);
+            sum = 1.0/sum;
+            ggml_vec_scale_f32(k, wsel, sum);
+        } else {
+            for (int j = 0; j < k; ++j) {
+                wsel[j] = probs[ids[j]];
+            }
+        }
+
+        if (a->norm) {
+            float s = 0;
+            ggml_vec_sum_f32(k, &s, wsel);
+            s = MAX(MIN(s, a->clamp_max), a->clamp_min);
+            for (int j = 0; j < k; ++j) {
+                wsel[j] = wsel[j] / s;
+            }
+        }
+        if (a->scale != 1.0f) {
+            ggml_vec_scale_f32(k, wsel, a->scale);
+        }
+
+        char * wt = (char *) w->data + t*w_nbt;
+        for (int j = 0; j < k; ++j) {
+            *(float *) (wt + j*w_nbj) = wsel[j];
+        }
+    }
+}
+
 // ggml_compute_forward_top_k
 
 struct cmp_top_k {

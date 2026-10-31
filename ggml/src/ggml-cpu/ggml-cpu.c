@@ -3349,6 +3349,239 @@ static void ggml_cpu_prefetch_moe_experts(const struct ggml_cgraph * cgraph, int
 }
 #endif
 
+// The graph allocator is not aware of the CPU fusions: the memory of an input of a fused group may be
+// reused for an output of a later node of the group (the input is dead after the first node).
+// The fused kernels read and write in one pass, so an output must not overlap an input.
+static bool ggml_cpu_fusion_overlap(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+// MoE router: [gating] -> RESHAPE -> [ADD bias] -> ARGSORT -> VIEW -> GET_ROWS
+//             [-> RESHAPE -> SUM_ROWS -> CLAMP -> DIV -> RESHAPE] [-> SCALE]
+// or delayed softmax (gpt-oss): ARGSORT -> VIEW -> GET_ROWS -> RESHAPE -> SOFT_MAX -> RESHAPE
+static int ggml_cpu_try_fuse_moe_router(const struct ggml_cgraph * cgraph, int node_n, const struct ggml_compute_params * params) {
+    struct ggml_tensor ** nodes = cgraph->nodes;
+    const int n_nodes = cgraph->n_nodes;
+    struct ggml_tensor * node = nodes[node_n];
+
+    struct ggml_moe_router_args a;
+    memset(&a, 0, sizeof(a));
+    a.scale = 1.0f;
+    a.softmax_scale = 1.0f;
+
+    enum ggml_op ops[16];
+    int n = 0;
+    int i = node_n;
+
+    #define NEXT(op_) ((i + 1 < n_nodes && nodes[i + 1]->op == (op_)) ? (ops[n++] = (op_), nodes[++i]) : NULL)
+
+    const struct ggml_tensor * probs = NULL;
+    if (node->op == GGML_OP_SOFT_MAX || (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID)) {
+        if (node->op == GGML_OP_SOFT_MAX) {
+            float max_bias;
+            memcpy(&a.softmax_scale, (const float *) node->op_params + 0, sizeof(float));
+            memcpy(&max_bias,        (const float *) node->op_params + 1, sizeof(float));
+            if (node->src[1] || node->src[2] || max_bias != 0.0f) {
+                return 0;
+            }
+            a.gating = GGML_MOE_ROUTER_SOFTMAX;
+        } else {
+            a.gating = GGML_MOE_ROUTER_SIGMOID;
+        }
+        ops[n++] = node->op;
+        probs = node;
+        a.logits = node->src[0];
+
+        const struct ggml_tensor * probs_r = NEXT(GGML_OP_RESHAPE);
+        if (!probs_r || probs_r->src[0] != probs) {
+            return 0;
+        }
+        const struct ggml_tensor * sel = probs;
+        if (i + 1 < n_nodes && nodes[i + 1]->op == GGML_OP_ADD && nodes[i + 1]->src[0] == probs) {
+            const struct ggml_tensor * add = NEXT(GGML_OP_ADD);
+            const struct ggml_tensor * b   = add->src[1];
+            if (b->type != GGML_TYPE_F32 || b->ne[0] != probs->ne[0] || ggml_nrows(b) != 1 || !ggml_is_contiguous(b)) {
+                return 0;
+            }
+            a.bias = b;
+            sel = add;
+        }
+        struct ggml_tensor * as = NEXT(GGML_OP_ARGSORT);
+        if (!as || as->src[0] != sel) {
+            return 0;
+        }
+        a.argsort = as;
+        const int i_view = i + 1;
+        const struct ggml_tensor * view = NEXT(GGML_OP_VIEW);
+        if (!view || view->src[0] != as || view->view_offs != 0 || view->ne[1] != as->ne[1]) {
+            return 0;
+        }
+        a.n_used = view->ne[0];
+        struct ggml_tensor * gr = NEXT(GGML_OP_GET_ROWS);
+        if (!gr || gr->src[0] != probs_r || gr->src[1] != view || gr->type != GGML_TYPE_F32) {
+            return 0;
+        }
+        struct ggml_tensor * last = gr;
+        int n_base = n, i_base = i;
+        // optional normalization
+        {
+            const struct ggml_tensor * r1 = NEXT(GGML_OP_RESHAPE);
+            const struct ggml_tensor * sr = r1 && r1->src[0] == last ? NEXT(GGML_OP_SUM_ROWS) : NULL;
+            const struct ggml_tensor * cl = sr && sr->src[0] == r1   ? NEXT(GGML_OP_CLAMP)    : NULL;
+            const struct ggml_tensor * dv = cl && cl->src[0] == sr   ? NEXT(GGML_OP_DIV)      : NULL;
+            struct ggml_tensor *       r2 = dv && dv->src[0] == r1 && dv->src[1] == cl ? NEXT(GGML_OP_RESHAPE) : NULL;
+            if (r2 && r2->src[0] == dv) {
+                a.norm = true;
+                memcpy(&a.clamp_min, (const float *) cl->op_params + 0, sizeof(float));
+                memcpy(&a.clamp_max, (const float *) cl->op_params + 1, sizeof(float));
+                last = r2;
+                n_base = n; i_base = i;
+            } else {
+                n = n_base; i = i_base;
+            }
+        }
+        // optional scale (without bias)
+        if (i + 1 < n_nodes && nodes[i + 1]->op == GGML_OP_SCALE && nodes[i + 1]->src[0] == last) {
+            float s, b;
+            memcpy(&s, (const float *) nodes[i + 1]->op_params + 0, sizeof(float));
+            memcpy(&b, (const float *) nodes[i + 1]->op_params + 1, sizeof(float));
+            if (b == 0.0f) {
+                last = NEXT(GGML_OP_SCALE);
+                a.scale = s;
+            }
+        }
+        a.weights = last;
+
+        const int outputs[2] = { i_view, i };
+        if (!ggml_can_fuse_subgraph(cgraph, node_n, n, ops, outputs, 2)) {
+            return 0;
+        }
+    } else if (node->op == GGML_OP_ARGSORT) {
+        a.gating  = GGML_MOE_ROUTER_DELAYED_SOFTMAX;
+        a.logits  = node->src[0];
+        a.argsort = node;
+        ops[n++] = GGML_OP_ARGSORT;
+        const int i_view = i + 1;
+        const struct ggml_tensor * view = NEXT(GGML_OP_VIEW);
+        if (!view || view->src[0] != node || view->view_offs != 0 || view->ne[1] != node->ne[1]) {
+            return 0;
+        }
+        a.n_used = view->ne[0];
+        const struct ggml_tensor * gr = NEXT(GGML_OP_GET_ROWS);
+        if (!gr || gr->src[1] != view || gr->type != GGML_TYPE_F32 ||
+            gr->src[0]->op != GGML_OP_RESHAPE || gr->src[0]->src[0] != a.logits) {
+            return 0;
+        }
+        const struct ggml_tensor * r1 = NEXT(GGML_OP_RESHAPE);
+        const struct ggml_tensor * sm = r1 && r1->src[0] == gr ? NEXT(GGML_OP_SOFT_MAX) : NULL;
+        struct ggml_tensor *       r2 = sm && sm->src[0] == r1 ? NEXT(GGML_OP_RESHAPE)  : NULL;
+        if (!r2 || r2->src[0] != sm) {
+            return 0;
+        }
+        float max_bias;
+        memcpy(&a.softmax_scale, (const float *) sm->op_params + 0, sizeof(float));
+        memcpy(&max_bias,        (const float *) sm->op_params + 1, sizeof(float));
+        if (sm->src[1] || sm->src[2] || max_bias != 0.0f) {
+            return 0;
+        }
+        a.weights = r2;
+        const int outputs[2] = { i_view, i };
+        if (!ggml_can_fuse_subgraph(cgraph, node_n, n, ops, outputs, 2)) {
+            return 0;
+        }
+    } else {
+        return 0;
+    }
+    #undef NEXT
+
+    // common constraints
+    const struct ggml_tensor * lg = a.logits;
+    if (lg->type != GGML_TYPE_F32 || lg->nb[0] != sizeof(float) || lg->ne[0] > GGML_MOE_ROUTER_MAX_EXPERTS ||
+        ggml_nrows(lg) != lg->ne[1] || a.argsort->ne[0] != lg->ne[0] || a.argsort->ne[1] != lg->ne[1] ||
+        ggml_get_op_params_i32(a.argsort, 0) != GGML_SORT_ORDER_DESC) {
+        return 0;
+    }
+    if (probs && (!ggml_is_contiguous(probs) || probs->type != GGML_TYPE_F32)) {
+        return 0;
+    }
+    const struct ggml_tensor * w = a.weights;
+    const bool w_ok = w->type == GGML_TYPE_F32 &&
+        ((w->ne[0] == 1 && w->ne[1] == a.n_used && w->ne[2] == lg->ne[1]) ||
+         (w->ne[0] == a.n_used && w->ne[1] == lg->ne[1] && w->ne[2] == 1));
+    if (!w_ok) {
+        return 0;
+    }
+    // the kernel reads a whole logits row before writing the outputs of that row: the outputs may reuse the
+    // memory of the logits only with a single row (token generation)
+    const bool overlap_in = ggml_cpu_fusion_overlap(a.argsort, lg) || ggml_cpu_fusion_overlap(w, lg);
+    if ((overlap_in && ggml_nrows(lg) != 1) || ggml_cpu_fusion_overlap(w, a.argsort) ||
+        (a.bias && (ggml_cpu_fusion_overlap(a.argsort, a.bias) || ggml_cpu_fusion_overlap(w, a.bias)))) {
+        return 0;
+    }
+
+    ggml_compute_forward_moe_router_fused(params, &a);
+    return n - 1;
+}
+
+// MoE weighted sum: MUL(experts, weights) -> n VIEWs -> chain of n - 1 ADDs
+static int ggml_cpu_try_fuse_moe_weighted_sum(const struct ggml_cgraph * cgraph, int node_n, const struct ggml_compute_params * params) {
+    struct ggml_tensor ** nodes = cgraph->nodes;
+    const struct ggml_tensor * mul = nodes[node_n];
+    const struct ggml_tensor * e   = mul->src[0];
+    const struct ggml_tensor * w   = mul->src[1];
+
+    if (mul->type != GGML_TYPE_F32 || e->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(mul, e) || e->nb[0] != sizeof(float) || !ggml_is_contiguous(mul) ||
+        w->ne[0] != 1 || w->ne[1] != e->ne[1] || w->ne[2] != e->ne[2] || e->ne[3] != 1 || w->ne[3] != 1) {
+        return 0;
+    }
+    const int k = (int) e->ne[1];
+    enum { MAX_K = 32 };
+    if (k < 2 || k > MAX_K || node_n + 2*k > cgraph->n_nodes) {
+        return 0;
+    }
+
+    enum ggml_op ops[1 + MAX_K + MAX_K];
+    int n = 0;
+    ops[n++] = GGML_OP_MUL;
+    for (int v = 0; v < k; ++v) {
+        const struct ggml_tensor * view = nodes[node_n + 1 + v];
+        if (view->op != GGML_OP_VIEW || view->src[0] != mul || view->view_offs != (size_t) v*mul->nb[1] ||
+            view->ne[0] != mul->ne[0] || view->ne[1] != mul->ne[2] || ggml_nrows(view) != mul->ne[2] || view->nb[1] != mul->nb[2]) {
+            return 0;
+        }
+        ops[n++] = GGML_OP_VIEW;
+    }
+    for (int j = 1; j < k; ++j) {
+        const struct ggml_tensor * add = nodes[node_n + k + j];
+        const struct ggml_tensor * lhs = j == 1 ? nodes[node_n + 1] : nodes[node_n + k + j - 1];
+        if (add->op != GGML_OP_ADD || add->src[0] != lhs || add->src[1] != nodes[node_n + 1 + j] || add->type != GGML_TYPE_F32) {
+            return 0;
+        }
+        ops[n++] = GGML_OP_ADD;
+    }
+    struct ggml_tensor * last = nodes[node_n + 2*k - 1];
+    if (last->nb[0] != sizeof(float) || last->ne[0] != mul->ne[0] || last->ne[1] != mul->ne[2] || ggml_nrows(last) != last->ne[1]) {
+        return 0;
+    }
+    const int outputs[1] = { node_n + 2*k - 1 };
+    int idxs[1 + MAX_K + MAX_K];
+    for (int j = 0; j < n; ++j) {
+        idxs[j] = node_n + j;
+    }
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, n, ops, outputs, 1)) {
+        return 0;
+    }
+    if (ggml_cpu_fusion_overlap(last, e) || ggml_cpu_fusion_overlap(last, w)) {
+        return 0;
+    }
+
+    ggml_compute_forward_moe_weighted_sum_f32(params, last, e, w, k);
+    return n - 1;
+}
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -3377,6 +3610,20 @@ static int ggml_cpu_try_fuse_ops(
                 ggml_compute_forward_rms_norm_mul_fused(params, node, mul_node);
                 return 1;
             }
+        }
+    }
+
+    if (node->op == GGML_OP_SOFT_MAX || node->op == GGML_OP_UNARY || node->op == GGML_OP_ARGSORT) {
+        const int n_fused = ggml_cpu_try_fuse_moe_router(cgraph, node_n, params);
+        if (n_fused > 0) {
+            return n_fused;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL) {
+        const int n_fused = ggml_cpu_try_fuse_moe_weighted_sum(cgraph, node_n, params);
+        if (n_fused > 0) {
+            return n_fused;
         }
     }
 
@@ -3413,6 +3660,11 @@ static int ggml_cpu_try_fuse_ops(
         bool ok = last->type == GGML_TYPE_F32 && last->nb[0] == sizeof(float);
         for (int i = 0; ok && i <= n_add; i++) {
             ok = srcs[i]->type == GGML_TYPE_F32 && srcs[i]->nb[0] == sizeof(float) && ggml_are_same_shape(srcs[i], last);
+            // an input may alias the output element for element (in-place), not overlap it otherwise
+            if (ok && ggml_cpu_fusion_overlap(srcs[i], last)) {
+                ok = srcs[i]->data == last->data && srcs[i]->nb[1] == last->nb[1] &&
+                     srcs[i]->nb[2] == last->nb[2] && srcs[i]->nb[3] == last->nb[3];
+            }
         }
         if (ok) {
             ggml_compute_forward_add_n_f32(params, last, srcs, n_add + 1);
