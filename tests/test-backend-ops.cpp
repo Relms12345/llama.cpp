@@ -4147,6 +4147,42 @@ struct test_add_add : public test_case {
     }
 };
 
+// chain of GGML_OP_ADD over views of one tensor, as in the aggregation of the MoE experts
+struct test_add_chain : public test_case {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const int     n_add_src; // number of summed tensors
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_CHAIN";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, n_add_src);
+    }
+
+    test_add_chain(int64_t n_embd = 64, int64_t n_tokens = 5, int n_add_src = 8)
+        : n_embd(n_embd), n_tokens(n_tokens), n_add_src(n_add_src) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // experts: [n_embd, n_add_src, n_tokens]
+        ggml_tensor * experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_add_src, n_tokens);
+        ggml_set_name(experts, "experts");
+
+        ggml_tensor * out = nullptr;
+        for (int i = 0; i < n_add_src; ++i) {
+            ggml_tensor * cur = ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+            out = out ? ggml_add(ctx, out, cur) : cur;
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_RMS_NORM (fused operation)
 struct test_add_rms_norm : public test_case {
     const ggml_type type;
@@ -11009,6 +11045,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F16, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
+    }
+    for (int64_t n_embd : {64, 300, 2048}) {
+        for (int64_t n_tokens : {1, 7}) {
+            for (int n_add_src : {2, 3, 8, 17, 20}) {
+                test_cases.emplace_back(new test_add_chain(n_embd, n_tokens, n_add_src));
+            }
+        }
     }
 
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, true));

@@ -1,5 +1,8 @@
 #include "binary-ops.h"
 
+#include <algorithm>
+#include <cstring>
+
 #if defined(GGML_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
 
@@ -151,4 +154,50 @@ void ggml_compute_forward_mul(const ggml_compute_params * params, ggml_tensor * 
 
 void ggml_compute_forward_div(const ggml_compute_params * params, ggml_tensor * dst) {
     binary_op<op_div>(params, dst);
+}
+
+void ggml_compute_forward_add_n_f32(const ggml_compute_params * params, ggml_tensor * dst, const ggml_tensor ** srcs, int n) {
+    GGML_ASSERT(n >= 2);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t ne0 = dst->ne[0];
+    const int64_t ne1 = dst->ne[1];
+    const int64_t ne2 = dst->ne[2];
+    const int64_t nr  = ggml_nrows(dst);
+
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = std::min(ir0 + dr, nr);
+
+    // accumulate in a small buffer: every input element is read before the destination
+    // element with the same index is written, so the destination may alias an input
+    constexpr int64_t CH = 256;
+    float acc[CH];
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3 = ir/(ne2*ne1);
+        const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
+        const int64_t i1 = (ir - i3*ne2*ne1 - i2*ne1);
+
+        float * dst_row = (float *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        for (int64_t c0 = 0; c0 < ne0; c0 += CH) {
+            const int64_t nc = std::min(CH, ne0 - c0);
+            const float * x0 = (const float *) ((const char *) srcs[0]->data + i1*srcs[0]->nb[1] + i2*srcs[0]->nb[2] + i3*srcs[0]->nb[3]) + c0;
+            const float * x1 = (const float *) ((const char *) srcs[1]->data + i1*srcs[1]->nb[1] + i2*srcs[1]->nb[2] + i3*srcs[1]->nb[3]) + c0;
+            for (int64_t i = 0; i < nc; ++i) {
+                acc[i] = x0[i] + x1[i];
+            }
+            for (int k = 2; k < n; ++k) {
+                const float * xk = (const float *) ((const char *) srcs[k]->data + i1*srcs[k]->nb[1] + i2*srcs[k]->nb[2] + i3*srcs[k]->nb[3]) + c0;
+                for (int64_t i = 0; i < nc; ++i) {
+                    acc[i] += xk[i];
+                }
+            }
+            memcpy(dst_row + c0, acc, nc*sizeof(float));
+        }
+    }
 }
