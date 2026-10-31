@@ -3291,6 +3291,46 @@ static int ggml_cpu_try_fuse_ops(
         }
     }
 
+    if (node->op == GGML_OP_ADD) {
+        // chain of F32 ADDs (e.g. the aggregation of the MoE experts): one pass and one barrier
+        // instead of one per ADD
+        enum { MAX_CHAIN = 16 };
+        enum ggml_op ops[MAX_CHAIN];
+        for (int i = 0; i < MAX_CHAIN; i++) {
+            ops[i] = GGML_OP_ADD;
+        }
+        int n_add = 1;
+        while (n_add < MAX_CHAIN && ggml_can_fuse(cgraph, node_n, ops, n_add + 1)) {
+            n_add++;
+        }
+        if (n_add < 2) {
+            return 0;
+        }
+
+        const struct ggml_tensor * srcs[MAX_CHAIN + 1];
+        srcs[0] = node->src[0];
+        srcs[1] = node->src[1];
+        for (int i = 1; i < n_add; i++) {
+            const struct ggml_tensor * cur  = cgraph->nodes[node_n + i];
+            const struct ggml_tensor * prev = cgraph->nodes[node_n + i - 1];
+            // IEEE addition is commutative, so (prev + x) == (x + prev): the summation order of the chain is kept
+            if (cur->src[0] == prev && cur->src[1] == prev) {
+                return 0;
+            }
+            srcs[i + 1] = cur->src[0] == prev ? cur->src[1] : cur->src[0];
+        }
+        struct ggml_tensor * last = cgraph->nodes[node_n + n_add - 1];
+
+        bool ok = last->type == GGML_TYPE_F32 && last->nb[0] == sizeof(float);
+        for (int i = 0; ok && i <= n_add; i++) {
+            ok = srcs[i]->type == GGML_TYPE_F32 && srcs[i]->nb[0] == sizeof(float) && ggml_are_same_shape(srcs[i], last);
+        }
+        if (ok) {
+            ggml_compute_forward_add_n_f32(params, last, srcs, n_add + 1);
+            return n_add - 1;
+        }
+    }
+
     return 0;
 }
 
