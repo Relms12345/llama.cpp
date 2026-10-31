@@ -33,6 +33,10 @@
 #include <unordered_set>
 #include <vector>
 
+#if defined(__linux__) && (defined(__aarch64__) || defined(__arm__))
+#include <sched.h>
+#endif
+
 #if defined(__APPLE__) && defined(__MACH__)
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -199,6 +203,50 @@ static int cpu_count_math_cpus(int n_cpu) {
 
 #endif // __x86_64__ && __linux__
 
+#if defined(__linux__) && (defined(__aarch64__) || defined(__arm__))
+// heterogeneous Arm CPUs (big.LITTLE / DynamIQ): count the cores with at least half the
+// capacity of the fastest core, the efficiency cores slow down the lockstep threading
+// returns -1 if the topology is unknown or homogeneous
+static int cpu_count_arm_perf_cores(void) {
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        return -1;
+    }
+    std::vector<long> caps;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &allowed)) {
+            continue;
+        }
+        long cap = -1;
+        for (const char * file : { "cpu_capacity", "cpufreq/cpuinfo_max_freq" }) {
+            std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/" + file);
+            if (f >> cap && cap > 0) {
+                break;
+            }
+            cap = -1;
+        }
+        if (cap <= 0) {
+            return -1;
+        }
+        caps.push_back(cap);
+    }
+    if (caps.size() < 2) {
+        return -1;
+    }
+    const long cap_max = *std::max_element(caps.begin(), caps.end());
+    const long cap_min = *std::min_element(caps.begin(), caps.end());
+    if (cap_max == cap_min) {
+        return -1;
+    }
+    int n_perf = 0;
+    for (long cap : caps) {
+        n_perf += 2*cap >= cap_max;
+    }
+    return n_perf;
+}
+#endif
+
 /**
  * Returns number of CPUs on system that are useful for math.
  */
@@ -217,6 +265,11 @@ int32_t common_cpu_get_num_math() {
                 return result;
             }
         }
+    }
+#elif defined(__linux__) && (defined(__aarch64__) || defined(__arm__))
+    const int n_perf = cpu_count_arm_perf_cores();
+    if (n_perf > 0) {
+        return n_perf;
     }
 #elif defined(__powerpc64__) || defined(__powerpc__)
     int32_t smt_factor = 1;

@@ -500,6 +500,7 @@ struct ggml_threadpool {
     int          n_threads;   // Number of threads in the pool
     int32_t      prio;        // Scheduling priority
     uint32_t     poll;        // Polling level (0 - no polling)
+    bool         auto_affinity; // CPU masks were chosen automatically (performance cores)
 
     enum ggml_status ec;
 };
@@ -2529,7 +2530,7 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data);
 #include "windows.h"
 
 // TODO: support > 64 CPUs
-static bool ggml_thread_apply_affinity(bool * mask) {
+static bool ggml_thread_apply_affinity(const bool * mask) {
     HANDLE    h = GetCurrentThread();
     uint64_t  bitmask = 0ULL;
 
@@ -2675,6 +2676,24 @@ static bool ggml_thread_apply_affinity(const bool * mask) {
     return true;
 }
 
+// best effort, used for automatic placement: failures (e.g. an Android cpuset that
+// excludes the performance cores while the app is in the background) are not reported
+static bool ggml_thread_apply_affinity_quiet(const bool * mask) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    for (uint32_t i = 0; i < GGML_MAX_N_THREADS; i++) {
+        if (mask[i]) {
+            CPU_SET(i, &cpuset);
+        }
+    }
+#ifdef __ANDROID__
+    return sched_setaffinity(0, sizeof(cpuset), &cpuset) == 0;
+#else
+    return pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0;
+#endif
+}
+#define GGML_HAVE_AFFINITY_QUIET
+
 static bool ggml_thread_apply_priority(int32_t prio) {
     struct sched_param p;
     int32_t policy = SCHED_OTHER;
@@ -2714,11 +2733,179 @@ static bool ggml_thread_apply_priority(int32_t prio) {
 
 #endif
 
+#ifndef GGML_HAVE_AFFINITY_QUIET
+static bool ggml_thread_apply_affinity_quiet(const bool * mask) {
+    return ggml_thread_apply_affinity(mask);
+}
+#endif
+
 static bool ggml_thread_cpumask_is_valid(const bool * mask) {
     for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
         if (mask[i]) { return true; }
     }
     return false;
+}
+
+//
+// automatic thread placement on heterogeneous (big.LITTLE / DynamIQ) CPUs
+//
+// When the caller did not provide a CPU mask and the CPU has cores with different
+// capacities, keep the compute threads on the performance cores: the lockstep
+// threading of ggml runs at the speed of the slowest thread, so a single thread on
+// an efficiency core slows down the whole graph.
+//
+// GGML_CPU_AFFINITY=off    : disable
+// GGML_CPU_AFFINITY=perf   : (default) restrict threads to the set of performance cores
+// GGML_CPU_AFFINITY=strict : pin thread i to the i-th fastest performance core
+//
+
+enum ggml_cpu_auto_affinity_mode {
+    GGML_CPU_AUTO_AFFINITY_OFF    = 0,
+    GGML_CPU_AUTO_AFFINITY_PERF   = 1,
+    GGML_CPU_AUTO_AFFINITY_STRICT = 2,
+};
+
+struct ggml_cpu_perf_cores {
+    int mode;
+    int n_perf;                      // number of performance cores, 0 if the CPU is homogeneous or unknown
+    int order[GGML_MAX_N_THREADS];   // performance cores, fastest first
+};
+
+static struct ggml_cpu_perf_cores ggml_perf_cores = { GGML_CPU_AUTO_AFFINITY_OFF, 0, { 0 } };
+
+#if defined(__linux__) && !defined(GGML_USE_OPENMP)
+static long ggml_read_sysfs_long(const char * path) {
+    FILE * f = fopen(path, "r");
+    if (!f) {
+        return -1;
+    }
+    long v = -1;
+    if (fscanf(f, "%ld", &v) != 1) {
+        v = -1;
+    }
+    fclose(f);
+    return v;
+}
+
+static void ggml_cpu_detect_perf_cores(struct ggml_cpu_perf_cores * pc) {
+    memset(pc, 0, sizeof(*pc));
+
+    const char * env = getenv("GGML_CPU_AFFINITY");
+    pc->mode = GGML_CPU_AUTO_AFFINITY_PERF;
+    if (env) {
+        if (strcmp(env, "off") == 0 || strcmp(env, "0") == 0) {
+            pc->mode = GGML_CPU_AUTO_AFFINITY_OFF;
+        } else if (strcmp(env, "strict") == 0) {
+            pc->mode = GGML_CPU_AUTO_AFFINITY_STRICT;
+        }
+    }
+    if (pc->mode == GGML_CPU_AUTO_AFFINITY_OFF) {
+        return;
+    }
+
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        return;
+    }
+
+    int  cpus[GGML_MAX_N_THREADS];
+    long caps[GGML_MAX_N_THREADS];
+    int  n = 0;
+    long cap_max = 0;
+    long cap_min = LONG_MAX;
+
+    const int n_max = GGML_MAX_N_THREADS < CPU_SETSIZE ? GGML_MAX_N_THREADS : CPU_SETSIZE;
+    for (int cpu = 0; cpu < n_max; cpu++) {
+        if (!CPU_ISSET(cpu, &allowed)) {
+            continue;
+        }
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpu_capacity", cpu);
+        long cap = ggml_read_sysfs_long(path);
+        if (cap <= 0) {
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+            cap = ggml_read_sysfs_long(path);
+        }
+        if (cap <= 0) {
+            // topology unknown - do not guess
+            return;
+        }
+        cpus[n] = cpu;
+        caps[n] = cap;
+        n++;
+        cap_max = cap > cap_max ? cap : cap_max;
+        cap_min = cap < cap_min ? cap : cap_min;
+    }
+
+    if (n < 2 || cap_max == cap_min) {
+        return; // homogeneous
+    }
+
+    // stable insertion sort by capacity, descending
+    for (int i = 1; i < n; i++) {
+        const int  c  = cpus[i];
+        const long cp = caps[i];
+        int j = i - 1;
+        while (j >= 0 && caps[j] < cp) {
+            cpus[j + 1] = cpus[j];
+            caps[j + 1] = caps[j];
+            j--;
+        }
+        cpus[j + 1] = c;
+        caps[j + 1] = cp;
+    }
+
+    // performance cores: at least half the capacity of the fastest core
+    for (int i = 0; i < n; i++) {
+        if (2*caps[i] < cap_max) {
+            break;
+        }
+        pc->order[pc->n_perf++] = cpus[i];
+    }
+
+    if (pc->n_perf == n) {
+        // nothing to exclude
+        pc->n_perf = 0;
+    }
+}
+#else
+static void ggml_cpu_detect_perf_cores(struct ggml_cpu_perf_cores * pc) {
+    memset(pc, 0, sizeof(*pc));
+}
+#endif
+
+// fill per-thread masks for a threadpool without a user provided mask
+// returns true if automatic placement was applied
+static bool ggml_thread_auto_affinity(struct ggml_compute_state * workers, int n_threads) {
+    const struct ggml_cpu_perf_cores * pc = &ggml_perf_cores;
+    if (pc->mode == GGML_CPU_AUTO_AFFINITY_OFF || pc->n_perf == 0 || n_threads > pc->n_perf) {
+        // more threads than performance cores: the user asked for the efficiency cores too
+        return false;
+    }
+    for (int j = 0; j < n_threads; j++) {
+        bool * mask = workers[j].cpumask;
+        memset(mask, 0, GGML_MAX_N_THREADS);
+        if (pc->mode == GGML_CPU_AUTO_AFFINITY_STRICT) {
+            mask[pc->order[j]] = true;
+        } else {
+            for (int i = 0; i < pc->n_perf; i++) {
+                mask[pc->order[i]] = true;
+            }
+        }
+    }
+    return true;
+}
+
+static void ggml_threadpool_apply_affinity(const struct ggml_threadpool * tp, const bool * mask) {
+    if (!ggml_thread_cpumask_is_valid(mask)) {
+        return;
+    }
+    if (tp->auto_affinity) {
+        ggml_thread_apply_affinity_quiet(mask);
+    } else {
+        ggml_thread_apply_affinity(mask);
+    }
 }
 
 static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask, bool strict, int32_t* iter) {
@@ -3249,9 +3436,7 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     struct ggml_threadpool * threadpool = state->threadpool;
 
     ggml_thread_apply_priority(threadpool->prio);
-    if (ggml_thread_cpumask_is_valid(state->cpumask)) {
-        ggml_thread_apply_affinity(state->cpumask);
-    }
+    ggml_threadpool_apply_affinity(state->threadpool, state->cpumask);
 
     while (true) {
         // Check if we need to sleep
@@ -3301,9 +3486,7 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
     if (threadpool->pause) {
        // Update main thread prio and affinity to match the threadpool settings
        ggml_thread_apply_priority(threadpool->prio);
-       if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
-           ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
-       }
+       ggml_threadpool_apply_affinity(threadpool, threadpool->workers[0].cpumask);
 
        // resume does cond broadcast
        ggml_threadpool_resume_locked(threadpool);
@@ -3337,6 +3520,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->n_threads        = tpp->n_threads;
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
+        threadpool->auto_affinity    = false;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
@@ -3352,12 +3536,19 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 
     threadpool->workers = workers;
 
+    // no user provided mask: keep the threads on the performance cores of heterogeneous CPUs
+    if (!ggml_thread_cpumask_is_valid(tpp->cpumask)) {
+        threadpool->auto_affinity = ggml_thread_auto_affinity(workers, tpp->n_threads);
+    }
+
 #ifdef GGML_USE_OPENMP
     int32_t cpumask_iter = 0;
 
     // Compute CPU masks for each thread
     for (int j = 0; j < tpp->n_threads; j++) {
-        ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
+        if (!threadpool->auto_affinity) {
+            ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
+        }
     }
 #else // GGML_USE_OPENMP
     ggml_mutex_init(&threadpool->mutex);
@@ -3369,20 +3560,22 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     int32_t cpumask_iter = 0;
 
     for (int j = 1; j < tpp->n_threads; j++) {
-        ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
+        if (!threadpool->auto_affinity) {
+            ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
+        }
 
         int32_t rc = ggml_thread_create(&workers[j].thrd, NULL, ggml_graph_compute_secondary_thread, &workers[j]);
         GGML_ASSERT(rc == 0);
     }
 
-    ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
+    if (!threadpool->auto_affinity) {
+        ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
+    }
 
     if (!threadpool->pause) {
         // Update main thread prio and affinity at the start, otherwise we'll do it in resume
         ggml_thread_apply_priority(threadpool->prio);
-        if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
-            ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
-        }
+        ggml_threadpool_apply_affinity(threadpool, threadpool->workers[0].cpumask);
     }
 #endif // GGML_USE_OPENMP
 
@@ -3436,9 +3629,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             int ith = omp_get_thread_num();
 
             ggml_thread_apply_priority(threadpool->prio);
-            if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
-                ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
-            }
+            ggml_threadpool_apply_affinity(threadpool, threadpool->workers[ith].cpumask);
             ggml_graph_compute_thread(&threadpool->workers[ith]);
         }
     } else {
@@ -3930,6 +4121,8 @@ void ggml_cpu_init(void) {
 #if defined(__ARM_ARCH)
         ggml_init_arm_arch_features();
 #endif
+
+        ggml_cpu_detect_perf_cores(&ggml_perf_cores);
 
 #if defined(__riscv)
         ggml_init_riscv_arch_features();
