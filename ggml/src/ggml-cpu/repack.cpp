@@ -15,6 +15,8 @@
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
+#include <vector>
+#include <algorithm>
 
 #include "repack.h"
 
@@ -4703,7 +4705,167 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
 };
 
+
+//
+// IQ quants (IQ1_S .. IQ3_S) for prompt processing: the weights stay in their format (no extra memory) and
+// are converted on the fly, 4 rows at a time, to the q8_0 4x8 layout of the i8mm GEMM. The 4 rows are
+// dequantized and re-quantized to Q8_0 (per 32 values), the converted rows of a chunk are kept per thread
+// so that the GEMM and the GEMV of the leftover src1 rows convert them only once. Token generation
+// (small batches) keeps the IQ vec_dot kernels, see iq_otf_tensor_traits.
+//
+struct iq_otf_cache {
+    const void *              vx = nullptr;
+    int                       n  = 0;
+    int                       nc = 0;
+    std::vector<float>        f;
+    std::vector<block_q8_0x4> q;
+};
+
+template <ggml_type TYPE>
+static const block_q8_0x4 * iq_otf_convert(int n, const void * vx, int nc) {
+    thread_local iq_otf_cache cache;
+    if (cache.vx == vx && cache.n == n && cache.nc == nc) {
+        return cache.q.data();
+    }
+    const size_t row_size = ggml_row_size(TYPE, n);
+    const ggml_to_float_t to_float = ggml_get_type_traits(TYPE)->to_float;
+    const int nb = n / QK8_0;
+
+    cache.f.resize((size_t) 4*n);
+    cache.q.resize((size_t) (nc/4)*nb);
+    for (int x = 0; x < nc/4; x++) {
+        for (int r = 0; r < 4; r++) {
+            to_float((const char *) vx + (size_t) (4*x + r)*row_size, cache.f.data() + (size_t) r*n, n);
+        }
+        ggml_quantize_mat_t<8, GGML_TYPE_Q8_0>(cache.f.data(), cache.q.data() + (size_t) x*nb, 4, n);
+    }
+    cache.vx = vx;
+    cache.n  = n;
+    cache.nc = nc;
+    return cache.q.data();
+}
+
+template <> int repack<block_iq2_xxs, 8, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    // the weights are converted on the fly: plain copy
+    if (t->ne[1] % 4 != 0) {
+        return -1;
+    }
+    memcpy(t->data, data, data_size);
+    return 0;
+}
+
+template <> void gemm<block_iq2_xxs, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_q8_0_4x8_q8_0(n, s, bs, iq_otf_convert<GGML_TYPE_IQ2_XXS>(n, vx, nc), vy, nr, nc);
+}
+
+template <> void gemv<block_iq2_xxs, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_q8_0_4x8_q8_0(n, s, bs, iq_otf_convert<GGML_TYPE_IQ2_XXS>(n, vx, nc), vy, nr, nc);
+}
+
+template <> int repack<block_iq2_xs, 8, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    // the weights are converted on the fly: plain copy
+    if (t->ne[1] % 4 != 0) {
+        return -1;
+    }
+    memcpy(t->data, data, data_size);
+    return 0;
+}
+
+template <> void gemm<block_iq2_xs, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_q8_0_4x8_q8_0(n, s, bs, iq_otf_convert<GGML_TYPE_IQ2_XS>(n, vx, nc), vy, nr, nc);
+}
+
+template <> void gemv<block_iq2_xs, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_q8_0_4x8_q8_0(n, s, bs, iq_otf_convert<GGML_TYPE_IQ2_XS>(n, vx, nc), vy, nr, nc);
+}
+
+template <> int repack<block_iq2_s, 8, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    // the weights are converted on the fly: plain copy
+    if (t->ne[1] % 4 != 0) {
+        return -1;
+    }
+    memcpy(t->data, data, data_size);
+    return 0;
+}
+
+template <> void gemm<block_iq2_s, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_q8_0_4x8_q8_0(n, s, bs, iq_otf_convert<GGML_TYPE_IQ2_S>(n, vx, nc), vy, nr, nc);
+}
+
+template <> void gemv<block_iq2_s, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_q8_0_4x8_q8_0(n, s, bs, iq_otf_convert<GGML_TYPE_IQ2_S>(n, vx, nc), vy, nr, nc);
+}
+
+template <> int repack<block_iq3_xxs, 8, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    // the weights are converted on the fly: plain copy
+    if (t->ne[1] % 4 != 0) {
+        return -1;
+    }
+    memcpy(t->data, data, data_size);
+    return 0;
+}
+
+template <> void gemm<block_iq3_xxs, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_q8_0_4x8_q8_0(n, s, bs, iq_otf_convert<GGML_TYPE_IQ3_XXS>(n, vx, nc), vy, nr, nc);
+}
+
+template <> void gemv<block_iq3_xxs, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_q8_0_4x8_q8_0(n, s, bs, iq_otf_convert<GGML_TYPE_IQ3_XXS>(n, vx, nc), vy, nr, nc);
+}
+
+template <> int repack<block_iq3_s, 8, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    // the weights are converted on the fly: plain copy
+    if (t->ne[1] % 4 != 0) {
+        return -1;
+    }
+    memcpy(t->data, data, data_size);
+    return 0;
+}
+
+template <> void gemm<block_iq3_s, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_q8_0_4x8_q8_0(n, s, bs, iq_otf_convert<GGML_TYPE_IQ3_S>(n, vx, nc), vy, nr, nc);
+}
+
+template <> void gemv<block_iq3_s, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_q8_0_4x8_q8_0(n, s, bs, iq_otf_convert<GGML_TYPE_IQ3_S>(n, vx, nc), vy, nr, nc);
+}
+
+template <> int repack<block_iq1_s, 8, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    // the weights are converted on the fly: plain copy
+    if (t->ne[1] % 4 != 0) {
+        return -1;
+    }
+    memcpy(t->data, data, data_size);
+    return 0;
+}
+
+template <> void gemm<block_iq1_s, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_q8_0_4x8_q8_0(n, s, bs, iq_otf_convert<GGML_TYPE_IQ1_S>(n, vx, nc), vy, nr, nc);
+}
+
+template <> void gemv<block_iq1_s, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_q8_0_4x8_q8_0(n, s, bs, iq_otf_convert<GGML_TYPE_IQ1_S>(n, vx, nc), vy, nr, nc);
+}
+
+template <> int repack<block_iq1_m, 8, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    // the weights are converted on the fly: plain copy
+    if (t->ne[1] % 4 != 0) {
+        return -1;
+    }
+    memcpy(t->data, data, data_size);
+    return 0;
+}
+
+template <> void gemm<block_iq1_m, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_q8_0_4x8_q8_0(n, s, bs, iq_otf_convert<GGML_TYPE_IQ1_M>(n, vx, nc), vy, nr, nc);
+}
+
+template <> void gemv<block_iq1_m, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_q8_0_4x8_q8_0(n, s, bs, iq_otf_convert<GGML_TYPE_IQ1_M>(n, vx, nc), vy, nr, nc);
+}
+
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
+  protected:
 
     bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
         // not realy a GGML_TYPE_Q8_0 but same size.
@@ -5071,6 +5233,53 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
     }
 };
 
+
+// on the fly IQ conversion: only for prompt processing, small batches fall back to the IQ vec_dot kernels
+template <typename BLOC_TYPE> class iq_otf_tensor_traits : public tensor_traits<BLOC_TYPE, 8, 4, GGML_TYPE_Q8_0> {
+    using base = tensor_traits<BLOC_TYPE, 8, 4, GGML_TYPE_Q8_0>;
+
+    static constexpr int64_t min_batch = 32;
+
+    static bool use_otf(const struct ggml_tensor * op) {
+        switch (op->op) {
+            case GGML_OP_MUL_MAT:    return op->src[1]->ne[1]*op->src[1]->ne[2] >= min_batch;
+            case GGML_OP_MUL_MAT_ID: return op->src[1]->ne[2] >= min_batch; // tokens
+            default:                 return false;
+        }
+    }
+
+    bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
+        if (!base::work_size(n_threads, op, size)) {
+            return false;
+        }
+        // the generic path (fallback) needs its own workspace, same as in ggml_graph_plan
+        const ggml_tensor * src0 = op->src[0];
+        const ggml_tensor * src1 = op->src[1];
+        const ggml_type vec_dot_type = ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
+        size_t cur = 0;
+        if (op->op == GGML_OP_MUL_MAT) {
+            cur = ggml_row_size(vec_dot_type, ggml_nelements(src1));
+        } else {
+            const ggml_tensor * ids = op->src[2];
+            const int64_t n_as = src0->ne[2];
+            cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);
+            cur += n_as*sizeof(int64_t) + sizeof(int64_t);
+            cur += n_as*ids->ne[0]*ids->ne[1]*2*sizeof(int32_t) + sizeof(int64_t);
+            cur += 256*n_as + 256; // atomic chunk counters, CACHE_LINE_SIZE <= 256
+        }
+        cur = GGML_PAD(cur, 64) + 64;
+        size = std::max(size, cur);
+        return true;
+    }
+
+    bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) override {
+        if (!use_otf(op)) {
+            return false;
+        }
+        return base::compute_forward(params, op);
+    }
+};
+
 }  // namespace ggml::cpu::repack
 
 static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
@@ -5110,6 +5319,15 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     // instance for Q8_0
     static const ggml::cpu::repack::tensor_traits<block_q8_0, 4, 4, GGML_TYPE_Q8_0> q8_0_4x4_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_q8_0, 8, 4, GGML_TYPE_Q8_0> q8_0_4x8_q8_0;
+
+    // instances for the on the fly IQ conversion (i8mm)
+    static const ggml::cpu::repack::iq_otf_tensor_traits<block_iq2_xxs> iq2_xxs_otf_q8_0;
+    static const ggml::cpu::repack::iq_otf_tensor_traits<block_iq2_xs> iq2_xs_otf_q8_0;
+    static const ggml::cpu::repack::iq_otf_tensor_traits<block_iq2_s> iq2_s_otf_q8_0;
+    static const ggml::cpu::repack::iq_otf_tensor_traits<block_iq3_xxs> iq3_xxs_otf_q8_0;
+    static const ggml::cpu::repack::iq_otf_tensor_traits<block_iq3_s> iq3_s_otf_q8_0;
+    static const ggml::cpu::repack::iq_otf_tensor_traits<block_iq1_s> iq1_s_otf_q8_0;
+    static const ggml::cpu::repack::iq_otf_tensor_traits<block_iq1_m> iq1_m_otf_q8_0;
 
     // instances for RISC-V
     //
@@ -5242,6 +5460,34 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
                 default:   { return nullptr; }
             }
             #endif
+        }
+    } else if (cur->type == GGML_TYPE_IQ2_XXS) {
+        if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8() && cur->ne[1] % 4 == 0) {
+            return &iq2_xxs_otf_q8_0;
+        }
+    } else if (cur->type == GGML_TYPE_IQ2_XS) {
+        if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8() && cur->ne[1] % 4 == 0) {
+            return &iq2_xs_otf_q8_0;
+        }
+    } else if (cur->type == GGML_TYPE_IQ2_S) {
+        if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8() && cur->ne[1] % 4 == 0) {
+            return &iq2_s_otf_q8_0;
+        }
+    } else if (cur->type == GGML_TYPE_IQ3_XXS) {
+        if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8() && cur->ne[1] % 4 == 0) {
+            return &iq3_xxs_otf_q8_0;
+        }
+    } else if (cur->type == GGML_TYPE_IQ3_S) {
+        if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8() && cur->ne[1] % 4 == 0) {
+            return &iq3_s_otf_q8_0;
+        }
+    } else if (cur->type == GGML_TYPE_IQ1_S) {
+        if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8() && cur->ne[1] % 4 == 0) {
+            return &iq1_s_otf_q8_0;
+        }
+    } else if (cur->type == GGML_TYPE_IQ1_M) {
+        if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8() && cur->ne[1] % 4 == 0) {
+            return &iq1_m_otf_q8_0;
         }
     } else if (cur->type == GGML_TYPE_IQ4_XS) {
         if (ggml_cpu_has_neon() && ggml_cpu_has_dotprod()) {
