@@ -11,6 +11,7 @@
 #include <string.h>
 #include <assert.h>
 #include <float.h>
+#include <math.h>
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
 
@@ -30,8 +31,55 @@ void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q2_0_ref(x, y, k);
 }
 
-void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_q4_0_ref(x, y, k);
+// Runtime Q4_0 quantization (e.g. a q4_0 KV cache; model files use quantize_q4_0). Start from the
+// reference max/-8 scale, then refit the scale by least squares weighted with x^2, which lowers the
+// error of the large values that dominate the attention scores (ref: ik_llama.cpp low-PPL Q4_0 KV cache).
+void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    static const int qk = QK4_0;
+    assert(k % qk == 0);
+
+    block_q4_0 * GGML_RESTRICT y = (block_q4_0 *) vy;
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float * xb = x + i*qk;
+
+        float amax = 0.0f;
+        float max  = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float v = xb[j];
+            if (amax < fabsf(v)) {
+                amax = fabsf(v);
+                max  = v;
+            }
+        }
+
+        float       d  = max / -8;
+        const float id = d ? 1.0f/d : 0.0f;
+
+        float sumqx = 0.0f;
+        float sumq2 = 0.0f;
+        for (int j = 0; j < qk/2; ++j) {
+            const float x0 = xb[0    + j];
+            const float x1 = xb[qk/2 + j];
+
+            const uint8_t xi0 = MIN(15, (int8_t)(x0*id + 8.5f));
+            const uint8_t xi1 = MIN(15, (int8_t)(x1*id + 8.5f));
+
+            const float q0 = (float) xi0 - 8.0f;
+            const float q1 = (float) xi1 - 8.0f;
+            const float w0 = x0*x0;
+            const float w1 = x1*x1;
+            sumqx += w0*q0*x0 + w1*q1*x1;
+            sumq2 += w0*q0*q0 + w1*q1*q1;
+
+            y[i].qs[j] = xi0 | (xi1 << 4);
+        }
+        if (sumq2 > 0.0f) {
+            d = sumqx/sumq2;
+        }
+        y[i].d = GGML_CPU_FP32_TO_FP16(d);
+    }
 }
 
 void quantize_row_q4_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
