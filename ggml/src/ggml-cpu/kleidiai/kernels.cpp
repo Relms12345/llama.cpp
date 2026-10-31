@@ -1086,11 +1086,13 @@ ggml_kleidiai_kernels * ggml_kleidiai_select_kernels(cpu_feature cpu_features, c
     ggml_kleidiai_kernels * kernel = nullptr;
 
     if (tensor->op == GGML_OP_MUL_MAT && tensor->src[0] != nullptr && tensor->src[1] != nullptr) {
+        // BF16 weights use the F16 kernels: the F16 path converts the weights to F32 before packing them
+        const ggml_type rhs_type = tensor->src[0]->type == GGML_TYPE_BF16 ? GGML_TYPE_F16 : tensor->src[0]->type;
         auto try_table = [&](auto & table) {
             for (size_t i = 0; i < NELEMS(table) - 1; ++i) {
                 if ((cpu_features & table[i].required_cpu) == table[i].required_cpu &&
                     table[i].lhs_type == tensor->src[1]->type &&
-                    table[i].rhs_type == tensor->src[0]->type &&
+                    table[i].rhs_type == rhs_type &&
                     table[i].op_type  == tensor->type) {
                     kernel = &table[i];
                     return true;
