@@ -660,6 +660,21 @@ static size_t round_down(size_t x, size_t y) {
     return y == 0 ? x : x - (x % y);
 }
 
+// BF16 -> F32 is exact: BF16 weights use the same packing and kernels as F16
+static void transpose_f32kxn_bf16nxk(size_t n, size_t k, float * dst, const uint16_t * src, size_t rhs_stride) {
+    size_t src_stride = rhs_stride / sizeof(uint16_t);
+    size_t dst_stride = n;
+
+    for (size_t k_idx = 0; k_idx < k; ++k_idx) {
+        for (size_t n_idx = 0; n_idx < n; ++n_idx) {
+            const uint32_t bits = (uint32_t) *(src + k_idx + n_idx * src_stride) << 16;
+            float v;
+            memcpy(&v, &bits, sizeof(v));
+            *(dst + n_idx + k_idx * dst_stride) = v;
+        }
+    }
+}
+
 static void transpose_f32kxn_f16nxk(size_t n, size_t k, float * dst, const uint16_t * src, size_t rhs_stride) {
     size_t src_stride = rhs_stride / sizeof(uint16_t);
     size_t dst_stride = n;
@@ -764,7 +779,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
             return true;
         }
 
-        if (op->src[0]->type == GGML_TYPE_F16) {
+        if (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16) {
             const int64_t lhs_batch_size0 = op->src[1]->ne[2];
             const int64_t rhs_batch_size0 = op->src[0]->ne[2];
             GGML_ASSERT(rhs_batch_size0 > 0);
@@ -823,7 +838,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
                 return compute_forward_qx(params, dst);
             } else if (dst->src[0]->type == GGML_TYPE_F32) {
                 return compute_forward_f32(params, dst);
-            } else if (dst->src[0]->type == GGML_TYPE_F16) {
+            } else if (dst->src[0]->type == GGML_TYPE_F16 || dst->src[0]->type == GGML_TYPE_BF16) {
                 return compute_forward_fp16(params, dst);
             }
         }
@@ -1088,10 +1103,17 @@ class tensor_traits : public ggml::cpu::tensor_traits {
             // RHS packing (single thread), then synchronize
             if (ith == 0) {
                 memset(bias, 0, (size_t)n * sizeof(float));
-                transpose_f32kxn_f16nxk((size_t)n, (size_t)k,
-                                        reinterpret_cast<float *>(rhs_kxn),
-                                        reinterpret_cast<const uint16_t *>(rhs_batch_base),
-                                        rhs_stride);
+                if (src0->type == GGML_TYPE_BF16) {
+                    transpose_f32kxn_bf16nxk((size_t)n, (size_t)k,
+                                            reinterpret_cast<float *>(rhs_kxn),
+                                            reinterpret_cast<const uint16_t *>(rhs_batch_base),
+                                            rhs_stride);
+                } else {
+                    transpose_f32kxn_f16nxk((size_t)n, (size_t)k,
+                                            reinterpret_cast<float *>(rhs_kxn),
+                                            reinterpret_cast<const uint16_t *>(rhs_batch_base),
+                                            rhs_stride);
+                }
 
                 kernels->rhs_info.pack_func_ex(1, n, k, nr, kr, sr, 0, n * sizeof(float),
                              rhs_kxn, bias, nullptr, rhs_packed, 0, nullptr);
@@ -1875,7 +1897,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                                       ggml_type_name(op->src[0]->type));
                     }
                 }
-                if (op->src[0]->type != GGML_TYPE_F16) {
+                if (op->src[0]->type != GGML_TYPE_F16 && op->src[0]->type != GGML_TYPE_BF16) {
                     return nullptr;
                 }
                 std::array<ggml_kleidiai_kernels *, GGML_KLEIDIAI_MAX_KERNEL_SLOTS> kernel_chain;
