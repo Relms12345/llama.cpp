@@ -100,6 +100,11 @@ struct ggml_backend_cpu_context {
     int                 n_threads;
     ggml_threadpool_t   threadpool;
 
+    // persistent threadpool owned by the backend, used when no threadpool is attached:
+    // avoids creating and joining the worker threads for every graph (i.e. every token)
+    ggml_threadpool_t   own_threadpool;
+    int                 own_n_threads;
+
     uint8_t *           work_data;
     size_t              work_size;
 
@@ -115,8 +120,43 @@ static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+static void ggml_backend_cpu_free_own_threadpool(struct ggml_backend_cpu_context * cpu_ctx) {
+    if (cpu_ctx->own_threadpool) {
+        ggml_threadpool_free(cpu_ctx->own_threadpool);
+        cpu_ctx->own_threadpool = NULL;
+    }
+}
+
+// threadpool to use for the next graph
+static ggml_threadpool_t ggml_backend_cpu_get_threadpool(struct ggml_backend_cpu_context * cpu_ctx) {
+    if (cpu_ctx->threadpool) {
+        return cpu_ctx->threadpool;
+    }
+#ifndef GGML_USE_OPENMP
+    static const bool disabled = [] {
+        const char * env = getenv("GGML_CPU_NO_PERSISTENT_THREADPOOL");
+        return env != NULL && atoi(env) != 0;
+    }();
+    if (disabled || cpu_ctx->n_threads <= 1) {
+        return NULL;
+    }
+    if (cpu_ctx->own_threadpool && cpu_ctx->own_n_threads != cpu_ctx->n_threads) {
+        ggml_backend_cpu_free_own_threadpool(cpu_ctx);
+    }
+    if (!cpu_ctx->own_threadpool) {
+        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(cpu_ctx->n_threads);
+        cpu_ctx->own_threadpool = ggml_threadpool_new(&tpp);
+        cpu_ctx->own_n_threads  = cpu_ctx->n_threads;
+    }
+    return cpu_ctx->own_threadpool;
+#else
+    return NULL;
+#endif
+}
+
 static void ggml_backend_cpu_free(ggml_backend_t backend) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    ggml_backend_cpu_free_own_threadpool(cpu_ctx);
     delete[] cpu_ctx->work_data;
     delete cpu_ctx;
     delete backend;
@@ -170,7 +210,7 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
-    struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
+    struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, ggml_backend_cpu_get_threadpool(cpu_ctx));
 
     if (cpu_ctx->work_size < cplan.work_size) {
         delete[] cpu_ctx->work_data;
@@ -225,6 +265,8 @@ ggml_backend_t ggml_backend_cpu_init(void) {
 
     ctx->n_threads           = GGML_DEFAULT_N_THREADS;
     ctx->threadpool          = NULL;
+    ctx->own_threadpool      = NULL;
+    ctx->own_n_threads       = 0;
     ctx->work_data           = NULL;
     ctx->work_size           = 0;
     ctx->abort_callback      = NULL;
@@ -265,6 +307,10 @@ void ggml_backend_cpu_set_threadpool(ggml_backend_t backend_cpu, ggml_threadpool
     if (ctx->threadpool && ctx->threadpool != threadpool) {
         // already had a different threadpool, pause/suspend it before switching
         ggml_threadpool_pause(ctx->threadpool);
+    }
+    if (threadpool) {
+        // an external threadpool replaces the backend owned one
+        ggml_backend_cpu_free_own_threadpool(ctx);
     }
     ctx->threadpool = threadpool;
 }
