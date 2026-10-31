@@ -9,6 +9,11 @@
 #define GGML_FA_TILE_Q  64
 #define GGML_FA_TILE_KV 64
 
+// flash attention decode: max number of q heads sharing a K/V head processed together
+#define GGML_FA_GQA_MAX 16
+// per-thread scratch of the grouped decode kernel, in floats
+#define GGML_FA_GQA_SCRATCH(DK, DV) (GGML_FA_GQA_MAX*((DK) + 2*(DV)) + (DV) + 64)
+
 #ifdef __cplusplus
 
 #include <utility>
