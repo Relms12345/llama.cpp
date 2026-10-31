@@ -3287,6 +3287,7 @@ static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_in
 // Opt-in: for resident weights the hints are pure syscall overhead.
 //
 static bool ggml_cpu_moe_prefetch = false;
+static bool ggml_cpu_fuse_ffn      = true; // GGML_CPU_FUSE_FFN=0 disables the up/gate/swiglu fusion
 
 #if (defined(__linux__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
 #include <sys/mman.h>
@@ -3582,6 +3583,93 @@ static int ggml_cpu_try_fuse_moe_weighted_sum(const struct ggml_cgraph * cgraph,
     return n - 1;
 }
 
+// FFN of a single token: MUL_MAT(W_a, x) + MUL_MAT(W_b, x) + GLU(swiglu, split), weights on the generic
+// (vec_dot) path. x is quantized once, and each chunk of 64 rows computes both dot products and the
+// swiglu, so the 3 nodes need one barrier after the quantization of x instead of one per node.
+// The rows, the dot products and the vectorized swiglu are those of the unfused nodes (identical results).
+static int ggml_cpu_try_fuse_ffn_up_gate(const struct ggml_cgraph * cgraph, int node_n, const struct ggml_compute_params * params) {
+    struct ggml_tensor ** nodes = cgraph->nodes;
+    if (node_n + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const struct ggml_tensor * m0  = nodes[node_n];
+    const struct ggml_tensor * m1  = nodes[node_n + 1];
+    struct ggml_tensor *       glu = nodes[node_n + 2];
+
+    if (m1->op != GGML_OP_MUL_MAT || glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == NULL) {
+        return 0;
+    }
+    const struct ggml_tensor * x  = m0->src[1];
+    const struct ggml_tensor * w0 = m0->src[0];
+    const struct ggml_tensor * w1 = m1->src[0];
+    if (m1->src[1] != x || x->type != GGML_TYPE_F32 || x->ne[1] != 1 || ggml_nrows(x) != 1 || !ggml_is_contiguous(x) ||
+        w0->type != w1->type || !ggml_is_quantized(w0->type) || !ggml_are_same_shape(w0, w1) || ggml_nrows(w0) != w0->ne[1] ||
+        w0->extra != NULL || w1->extra != NULL || w0->nb[0] != ggml_type_size(w0->type) || w1->nb[0] != ggml_type_size(w1->type)) {
+        return 0;
+    }
+    // silu(src0) * src1
+    const struct ggml_tensor * mg = glu->src[0];
+    const struct ggml_tensor * mu = glu->src[1];
+    if (!((mg == m0 && mu == m1) || (mg == m1 && mu == m0)) || glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) ||
+        m0->type != GGML_TYPE_F32 || m1->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    const enum ggml_op ops[3] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
+    const int outputs[1] = { node_n + 2 };
+    if (!ggml_can_fuse_subgraph(cgraph, node_n, 3, ops, outputs, 1)) {
+        return 0;
+    }
+    const enum ggml_type    vec_dot_type = type_traits_cpu[w0->type].vec_dot_type;
+    // x is read (quantized to the workspace) before the barrier, the output may reuse its memory
+    if (x->type == vec_dot_type && ggml_cpu_fusion_overlap(glu, x)) {
+        return 0;
+    }
+    ggml_from_float_t const from_float   = type_traits_cpu[vec_dot_type].from_float;
+    ggml_vec_dot_t    const vec_dot      = type_traits_cpu[w0->type].vec_dot;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t ne00 = w0->ne[0];
+    const int64_t nr   = w0->ne[1];
+
+    // quantize x, split by blocks as in ggml_compute_forward_mul_mat
+    const void * xq = x->data;
+    if (x->type != vec_dot_type) {
+        GGML_ASSERT(params->wsize >= ggml_row_size(vec_dot_type, ne00));
+        const int64_t bs  = ggml_blck_size(vec_dot_type);
+        const int64_t b0  = (ith * ne00/bs) / nth;
+        const int64_t b1  = ((ith + 1) * ne00/bs) / nth;
+        const size_t  nbw = ggml_type_size(vec_dot_type);
+        from_float((const float *) x->data + b0*bs, (char *) params->wdata + b0*nbw, (b1 - b0)*bs);
+        xq = params->wdata;
+    }
+    if (ith == 0) {
+        ggml_threadpool_chunk_set(params->threadpool, nth);
+    }
+    ggml_barrier(params->threadpool);
+
+    const struct ggml_tensor * wg = mg == m0 ? w0 : w1; // gate: silu(.)
+    const struct ggml_tensor * wu = mg == m0 ? w1 : w0;
+
+    enum { CH = 64 }; // multiple of every SIMD width: same vectorized/scalar split of the swiglu as the unfused node
+    float g[CH];
+    float u[CH];
+    const int64_t nchunk = (nr + CH - 1)/CH;
+    float * dst = (float *) glu->data;
+
+    for (int64_t c = ith; c < nchunk; c = ggml_threadpool_chunk_add(params->threadpool, 1)) {
+        const int64_t r0 = c*CH;
+        const int64_t r1 = MIN(r0 + CH, nr);
+        for (int64_t r = r0; r < r1; ++r) {
+            vec_dot(ne00, &g[r - r0], 0, (const char *) wg->data + r*wg->nb[1], 0, xq, 0, 1);
+            vec_dot(ne00, &u[r - r0], 0, (const char *) wu->data + r*wu->nb[1], 0, xq, 0, 1);
+        }
+        ggml_vec_swiglu_f32(r1 - r0, dst + r0, g, u);
+    }
+
+    return 2;
+}
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -3615,6 +3703,13 @@ static int ggml_cpu_try_fuse_ops(
 
     if (node->op == GGML_OP_SOFT_MAX || node->op == GGML_OP_UNARY || node->op == GGML_OP_ARGSORT) {
         const int n_fused = ggml_cpu_try_fuse_moe_router(cgraph, node_n, params);
+        if (n_fused > 0) {
+            return n_fused;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT && ggml_cpu_fuse_ffn) {
+        const int n_fused = ggml_cpu_try_fuse_ffn_up_gate(cgraph, node_n, params);
         if (n_fused > 0) {
             return n_fused;
         }
@@ -4537,6 +4632,11 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+        }
+
+        {
+            const char * env = getenv("GGML_CPU_FUSE_FFN");
+            ggml_cpu_fuse_ffn = !(env != NULL && atoi(env) == 0);
         }
 
         {
