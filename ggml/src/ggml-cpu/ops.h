@@ -44,6 +44,32 @@ void ggml_compute_forward_silu_back(const struct ggml_compute_params * params, s
 void ggml_compute_forward_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_rms_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_rms_norm_mul_fused(const struct ggml_compute_params * params, struct ggml_tensor * dst_rms_norm, struct ggml_tensor * dst_mul);
+
+// fused MoE router: gating (softmax/sigmoid) [+ selection bias] -> argsort top-k -> get_rows [-> normalize] [-> scale],
+// or (delayed) argsort top-k of the logits -> get_rows -> softmax over the selected experts
+enum ggml_moe_router_gating {
+    GGML_MOE_ROUTER_SOFTMAX = 0,
+    GGML_MOE_ROUTER_SIGMOID = 1,
+    GGML_MOE_ROUTER_DELAYED_SOFTMAX = 2,
+};
+
+struct ggml_moe_router_args {
+    const struct ggml_tensor * logits;    // [n_expert, n_tokens] F32
+    enum ggml_moe_router_gating gating;
+    float                      softmax_scale;
+    const struct ggml_tensor * bias;      // selection bias [n_expert] or NULL
+    struct ggml_tensor *       argsort;   // [n_expert, n_tokens] I32, the full descending sort is written
+    int                        n_used;
+    bool                       norm;      // weights /= clamp(sum(weights), clamp_min, clamp_max)
+    float                      clamp_min;
+    float                      clamp_max;
+    float                      scale;     // weights *= scale (1.0f: none)
+    struct ggml_tensor *       weights;   // output, [1, n_used, n_tokens] or [n_used, n_tokens]
+};
+
+#define GGML_MOE_ROUTER_MAX_EXPERTS 1024
+
+void ggml_compute_forward_moe_router_fused(const struct ggml_compute_params * params, const struct ggml_moe_router_args * args);
 void ggml_compute_forward_rms_norm_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_group_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_l2_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);

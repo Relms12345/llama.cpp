@@ -201,3 +201,49 @@ void ggml_compute_forward_add_n_f32(const ggml_compute_params * params, ggml_ten
         }
     }
 }
+
+void ggml_compute_forward_moe_weighted_sum_f32(const ggml_compute_params * params, ggml_tensor * dst,
+        const ggml_tensor * experts, const ggml_tensor * weights, int n) {
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->nb[0] == sizeof(float));
+    GGML_ASSERT(experts->type == GGML_TYPE_F32 && experts->nb[0] == sizeof(float));
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t ne0 = dst->ne[0];
+    const int64_t nr  = dst->ne[1]; // tokens
+
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = std::min(ir0 + dr, nr);
+
+    // products and sums are separate steps: same rounding as MUL then ADD, no FMA contraction
+    constexpr int64_t CH = 256;
+    float acc[CH];
+    float prod[CH];
+
+    for (int64_t t = ir0; t < ir1; ++t) {
+        float * dst_row = (float *) ((char *) dst->data + t*dst->nb[1]);
+        for (int64_t c0 = 0; c0 < ne0; c0 += CH) {
+            const int64_t nc = std::min(CH, ne0 - c0);
+            for (int i = 0; i < n; ++i) {
+                const float * e = (const float *) ((const char *) experts->data + i*experts->nb[1] + t*experts->nb[2]) + c0;
+                const float   w = *(const float *) ((const char *) weights->data + i*weights->nb[1] + t*weights->nb[2]);
+                if (i == 0) {
+                    for (int64_t j = 0; j < nc; ++j) {
+                        acc[j] = e[j]*w;
+                    }
+                } else {
+                    for (int64_t j = 0; j < nc; ++j) {
+                        prod[j] = e[j]*w;
+                    }
+                    for (int64_t j = 0; j < nc; ++j) {
+                        acc[j] += prod[j];
+                    }
+                }
+            }
+            memcpy(dst_row + c0, acc, nc*sizeof(float));
+        }
+    }
+}
