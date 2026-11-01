@@ -288,6 +288,53 @@ typedef struct {
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
 //
+// TurboQuant KV cache types (runtime only)
+//
+// Each block holds one group of 128 values, rotated by the TurboQuant transform and normalized to unit
+// length before quantization; the codes index a Lloyd-Max codebook for N(0, 1/128). The values decode to
+// centroid * norm and stay in the rotated domain: the graph rotates Q the same way and rotates the
+// attention output back (GGML_OP_TURBO_WHT).
+#define QK_TURBO 128
+
+// 2.125 bpw: 2-bit codes
+typedef struct {
+    ggml_half norm;            // corrected L2 norm
+    uint8_t   qs[QK_TURBO/4];  // 2-bit codes, 4 per byte, element j at bits 2*(j%4)
+} block_turbo2_0;
+static_assert(sizeof(block_turbo2_0) == sizeof(ggml_half) + QK_TURBO/4, "wrong turbo2_0 block size/padding");
+
+// 3.125 bpw: 3-bit codes, low 2 bits in qs, high bit in signs
+typedef struct {
+    ggml_half norm;
+    uint8_t   qs[QK_TURBO/4];    // low 2 bits of the code, 4 per byte
+    uint8_t   signs[QK_TURBO/8]; // high bit of the code, 8 per byte, element j at bit j%8
+} block_turbo3_0;
+static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO/4 + QK_TURBO/8, "wrong turbo3_0 block size/padding");
+
+// 4.125 bpw: 4-bit codes
+typedef struct {
+    ggml_half norm;
+    uint8_t   qs[QK_TURBO/2];  // 4-bit codes, element j in the low (j even) or high (j odd) nibble of qs[j/2]
+} block_turbo4_0;
+static_assert(sizeof(block_turbo4_0) == sizeof(ggml_half) + QK_TURBO/2, "wrong turbo4_0 block size/padding");
+
+// 5.125 bpw: antisymmetric 32-entry codebook stored as sign + 4-bit magnitude
+typedef struct {
+    ggml_half norm;
+    uint8_t   qs[QK_TURBO/2];  // magnitude m, nibbles as in turbo4: |value| = c[16 + m]
+    uint8_t   qh[QK_TURBO/8];  // sign, 1 = negative, element j at bit j%8
+} block_turbo5_0;
+static_assert(sizeof(block_turbo5_0) == sizeof(ggml_half) + QK_TURBO/2 + QK_TURBO/8, "wrong turbo5_0 block size/padding");
+
+// 6.125 bpw: 6-bit codes, low 4 bits in qs, high 2 bits in qh
+typedef struct {
+    ggml_half norm;
+    uint8_t   qs[QK_TURBO/2];  // low 4 bits of the code, nibbles as in turbo4
+    uint8_t   qh[QK_TURBO/4];  // high 2 bits of the code, element j at bits 2*(j%4) of qh[j/4]
+} block_turbo6_0;
+static_assert(sizeof(block_turbo6_0) == sizeof(ggml_half) + QK_TURBO/2 + QK_TURBO/4, "wrong turbo6_0 block size/padding");
+
+//
 // Super-block quantization structures
 //
 
@@ -1127,6 +1174,85 @@ GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
 #define kvalues_mxfp4 kvalues_fp4
+
+// TurboQuant codebooks: Lloyd-Max centroids for N(0, 1/128), and the midpoints between consecutive
+// centroids (the code of x is the number of midpoints <= x)
+GGML_TABLE_BEGIN(float, turbo_c2, 4)
+    -0.133462f, -0.039994f, 0.039994f, 0.133462f,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, turbo_m2, 3)
+    -0.086728f, 0.000000f, 0.086728f,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, turbo_c3, 8)
+    -0.190207f, -0.118786f, -0.066822f, -0.021663f, 0.021663f, 0.066822f, 0.118786f, 0.190207f,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, turbo_m3, 7)
+    -0.154496f, -0.092804f, -0.044243f, 0.000000f, 0.044243f, 0.092804f, 0.154496f,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, turbo_c4, 16)
+    -0.241529f, -0.182877f, -0.143016f, -0.111036f, -0.083292f, -0.058050f, -0.034299f, -0.011349f,
+     0.011349f,  0.034299f,  0.058050f,  0.083292f,  0.111036f,  0.143016f,  0.182877f,  0.241529f,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, turbo_m4, 15)
+    -0.212203f, -0.162947f, -0.127026f, -0.097164f, -0.070671f, -0.046174f, -0.022824f, 0.000000f,
+     0.022824f,  0.046174f,  0.070671f,  0.097164f,  0.127026f,  0.162947f,  0.212203f,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, turbo_c5, 32)
+    -0.288236f, -0.237892f, -0.204892f, -0.179348f, -0.158003f, -0.139353f, -0.122569f, -0.107141f,
+    -0.092730f, -0.079097f, -0.066064f, -0.053491f, -0.041269f, -0.029304f, -0.017515f, -0.005827f,
+     0.005827f,  0.017515f,  0.029304f,  0.041269f,  0.053491f,  0.066064f,  0.079097f,  0.092730f,
+     0.107141f,  0.122569f,  0.139353f,  0.158003f,  0.179348f,  0.204892f,  0.237892f,  0.288236f,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, turbo_m5, 31)
+    -0.263064f, -0.221392f, -0.192120f, -0.168675f, -0.148678f, -0.130961f, -0.114855f, -0.099935f,
+    -0.085914f, -0.072580f, -0.059778f, -0.047380f, -0.035287f, -0.023410f, -0.011671f,  0.000000f,
+     0.011671f,  0.023410f,  0.035287f,  0.047380f,  0.059778f,  0.072580f,  0.085914f,  0.099935f,
+     0.114855f,  0.130961f,  0.148678f,  0.168675f,  0.192120f,  0.221392f,  0.263064f,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, turbo_c6, 64)
+    -0.330935f, -0.286417f, -0.257865f, -0.236198f, -0.218435f, -0.203203f, -0.189753f, -0.177626f,
+    -0.166522f, -0.156230f, -0.146600f, -0.137517f, -0.128895f, -0.120663f, -0.112765f, -0.105157f,
+    -0.097801f, -0.090663f, -0.083717f, -0.076940f, -0.070310f, -0.063809f, -0.057422f, -0.051133f,
+    -0.044929f, -0.038798f, -0.032729f, -0.026710f, -0.020733f, -0.014787f, -0.008863f, -0.002953f,
+     0.002953f,  0.008863f,  0.014787f,  0.020733f,  0.026710f,  0.032729f,  0.038798f,  0.044929f,
+     0.051133f,  0.057422f,  0.063809f,  0.070310f,  0.076940f,  0.083717f,  0.090663f,  0.097801f,
+     0.105157f,  0.112765f,  0.120663f,  0.128895f,  0.137517f,  0.146600f,  0.156230f,  0.166522f,
+     0.177626f,  0.189753f,  0.203203f,  0.218435f,  0.236198f,  0.257865f,  0.286417f,  0.330935f,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, turbo_m6, 63)
+    -0.308676f, -0.272141f, -0.247031f, -0.227316f, -0.210819f, -0.196478f, -0.183690f, -0.172074f,
+    -0.161376f, -0.151415f, -0.142059f, -0.133206f, -0.124779f, -0.116714f, -0.108961f, -0.101479f,
+    -0.094232f, -0.087190f, -0.080329f, -0.073625f, -0.067060f, -0.060616f, -0.054277f, -0.048031f,
+    -0.041864f, -0.035763f, -0.029719f, -0.023722f, -0.017760f, -0.011825f, -0.005908f,  0.000000f,
+     0.005908f,  0.011825f,  0.017760f,  0.023722f,  0.029719f,  0.035763f,  0.041864f,  0.048031f,
+     0.054277f,  0.060616f,  0.067060f,  0.073625f,  0.080329f,  0.087190f,  0.094232f,  0.101479f,
+     0.108961f,  0.116714f,  0.124779f,  0.133206f,  0.142059f,  0.151415f,  0.161376f,  0.172074f,
+     0.183690f,  0.196478f,  0.210819f,  0.227316f,  0.247031f,  0.272141f,  0.308676f,
+GGML_TABLE_END()
+
+// TurboQuant rotation signs: x -> s2 * (H * (s1 * x)) / sqrt(128), H the 128x128 Walsh-Hadamard matrix
+GGML_TABLE_BEGIN(float, turbo_s1, 128)
+    -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1, 1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+    -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1, 1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1, 1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+    -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1, 1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, turbo_s2, 128)
+     1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+     1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1, 1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,-1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1,
+GGML_TABLE_END()
 
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f

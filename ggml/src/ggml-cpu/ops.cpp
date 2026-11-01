@@ -7,6 +7,7 @@
 #include "ggml.h"
 #include "unary-ops.h"
 #include "vec.h"
+#include "turbo.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -6137,6 +6138,11 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO5_0:
+        case GGML_TYPE_TURBO6_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -9004,7 +9010,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
     ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
     ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
-    ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
+    ggml_to_float_t   const v_to_float     = ggml_cpu_get_to_float(v->type);
 
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
@@ -9228,7 +9234,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_gqa(
     ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
     ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
     ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
-    ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
+    ggml_to_float_t   const v_to_float     = ggml_cpu_get_to_float(v->type);
 
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
@@ -9441,8 +9447,8 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     // quantized K/V are dequantized to F32 while packing the tiles, K and V types may differ
     const ggml_type k_type = k->type;
     const ggml_type v_type = v->type;
-    ggml_to_float_t const k_to_float = ggml_get_type_traits(k_type)->to_float;
-    ggml_to_float_t const v_to_float = ggml_get_type_traits(v_type)->to_float;
+    ggml_to_float_t const k_to_float = ggml_cpu_get_to_float(k_type);
+    ggml_to_float_t const v_to_float = ggml_cpu_get_to_float(v_type);
     GGML_ASSERT(k_type == GGML_TYPE_F32 || k_type == GGML_TYPE_F16 || k_to_float);
     GGML_ASSERT(v_type == GGML_TYPE_F32 || v_type == GGML_TYPE_F16 || v_to_float);
 
@@ -11674,6 +11680,46 @@ static void ggml_compute_forward_gated_delta_net_f32(
 
         ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1);
         current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+    }
+}
+
+// ggml_compute_forward_turbo_wht
+
+void ggml_compute_forward_turbo_wht(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int direction = ggml_get_op_params_i32(dst, 0);
+
+    const int64_t ne0 = src0->ne[0];
+    const int64_t ne1 = src0->ne[1];
+    const int64_t ne2 = src0->ne[2];
+    const int64_t ne3 = src0->ne[3];
+
+    // one task = one group of 128 values
+    const int64_t n_grp = ne0/128;
+    const int64_t n     = n_grp*ne1*ne2*ne3;
+    const int64_t dr    = (n + params->nth - 1)/params->nth;
+    const int64_t i0    = dr*params->ith;
+    const int64_t i1    = std::min(i0 + dr, n);
+
+    for (int64_t i = i0; i < i1; ++i) {
+        const int64_t ig  = i % n_grp;
+        const int64_t ir  = i / n_grp;
+        const int64_t i01 = ir % ne1;
+        const int64_t i02 = (ir / ne1) % ne2;
+        const int64_t i03 = ir / (ne1*ne2);
+
+        const float * x = (const float *) ((const char *) src0->data + i01*src0->nb[1] + i02*src0->nb[2] + i03*src0->nb[3]) + 128*ig;
+        float       * y = (float       *) ((      char *)  dst->data + i01* dst->nb[1] + i02* dst->nb[2] + i03* dst->nb[3]) + 128*ig;
+
+        memcpy(y, x, 128*sizeof(float));
+        ggml_cpu_turbo_rotate(y, 128, direction);
     }
 }
 

@@ -5368,6 +5368,14 @@ static bool validate_e_e8m0(uint8_t e, size_t i) {
         } \
     }
 
+#define VALIDATE_ROW_DATA_NORM_F16_IMPL(type, data, nb) \
+    const type * q = (const type *) (data); \
+    for (size_t i = 0; i < (nb); ++i) { \
+        if (!validate_fp16(q[i].norm, i)) { \
+            return false; \
+        } \
+    }
+
 #define VALIDATE_ROW_DATA_DM_F16_IMPL(type, data, nb, d, m) \
     const type * q = (const type *) (data); \
     for (size_t i = 0; i < (nb); ++i) { \
@@ -5602,6 +5610,11 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
             } break;
+        case GGML_TYPE_TURBO2_0: { VALIDATE_ROW_DATA_NORM_F16_IMPL(block_turbo2_0, data, nb); } break;
+        case GGML_TYPE_TURBO3_0: { VALIDATE_ROW_DATA_NORM_F16_IMPL(block_turbo3_0, data, nb); } break;
+        case GGML_TYPE_TURBO4_0: { VALIDATE_ROW_DATA_NORM_F16_IMPL(block_turbo4_0, data, nb); } break;
+        case GGML_TYPE_TURBO5_0: { VALIDATE_ROW_DATA_NORM_F16_IMPL(block_turbo5_0, data, nb); } break;
+        case GGML_TYPE_TURBO6_0: { VALIDATE_ROW_DATA_NORM_F16_IMPL(block_turbo6_0, data, nb); } break;
         case GGML_TYPE_IQ1_S:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq1_s, data, nb);

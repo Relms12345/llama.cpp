@@ -6552,6 +6552,11 @@ class GGMLQuantizationType(IntEnum):
     Q1_0    = 41
     Q2_0    = 42
     F8_E4M3 = 43
+    TURBO3_0 = 44  # TurboQuant KV cache types: runtime only, never in model files
+    TURBO4_0 = 47
+    TURBO5_0 = 51
+    TURBO6_0 = 52
+    TURBO2_0 = 53
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6781,6 +6786,11 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
     GGMLQuantizationType.F8_E4M3: (1, 1),
+    GGMLQuantizationType.TURBO2_0: (128, 2 + 32),
+    GGMLQuantizationType.TURBO3_0: (128, 2 + 32 + 16),
+    GGMLQuantizationType.TURBO4_0: (128, 2 + 64),
+    GGMLQuantizationType.TURBO5_0: (128, 2 + 64 + 16),
+    GGMLQuantizationType.TURBO6_0: (128, 2 + 64 + 32),
 }
 
 
