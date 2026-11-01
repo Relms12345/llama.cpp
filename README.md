@@ -17,6 +17,44 @@
 
 </div>
 
+## CPU expert streaming (local extension)
+
+Set `llama_model_params.moe_cache_bytes` before loading to bound the memory used by routed
+`MUL_MAT_ID` expert weights (`*_exps.weight`). Zero keeps normal loading.
+
+- If all routed experts fit the budget, nothing is streamed: the model loads normally and keeps
+  every regular kernel (CPU_REPACK, KleidiAI, fusions), so decoding runs at the normal speed.
+  `llama_model_get_moe_cache_stats` then reports `used_bytes` = the expert size and no reads.
+- Otherwise the expert tensors stay unread in the file mapping and a model-owned LRU cache reads
+  whole expert slices with `pread`. After a read the file pages are dropped
+  (`POSIX_FADV_DONTNEED`) so the data is not held twice. Supported CPU_REPACK formats are packed in
+  place on a miss, with one row group of scratch charged to the budget; if that does not fit, or
+  there is no repack kernel, the canonical kernels are used.
+
+Per MUL_MAT_ID node one worker pins all the experts the batch selected in a single locked call, the
+workers compute them without synchronizing between experts, and the experts are released after one
+barrier. If the selected experts do not fit together (large prompt batches), they are processed in
+groups that fit. Cache hits do not allocate. Provider lookups from the compute threads are lock-free.
+Streaming needs the CPU backend and POSIX `pread`, and rejects GPU offload, `mlock` and eager tensor
+validation. Read failures fail the decode (`GGML_STATUS_FAILED`) instead of looking like an abort.
+Contexts must be freed before their model.
+
+`llama_model_moe_cache_prefill(model, profile_path, progress, user_data)`, called after loading and
+before creating contexts, fills the cache up to the budget: frequently used experts first, then
+recently used ones, or spread over the layers without a profile. The profile file stores usage
+counts only, is tied to the GGUF file identity and tensor layout, and is ignored when stale or
+malformed. `llama_model_moe_cache_save` writes it (also done when the model is freed). Warm-up reads
+count in `bytes_read` but not as misses.
+
+`ggml_cpu_set_moe_prefetch(bool)` toggles the expert prefetch hints at runtime
+(`GGML_CPU_MOE_PREFETCH` sets the initial value); for streamed experts only uncached ones are
+hinted. `GGML_CPU_AFFINITY=off|perf|strict` selects the CPU placement before the CPU backend starts,
+and `ggml_cpu_get_affinity_status` describes what the last threadpool got.
+
+`test-moe-stream` (`ctest -R '^test-moe-stream$' --output-on-failure`) covers eviction, pinning,
+partial groups, warm-up and profiles, repacked Q4_K experts, logits parity of streamed vs. normal
+loading (F32/Q8_0, one and four threads, budgets of one expert to all experts) and read failures.
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:

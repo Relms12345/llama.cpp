@@ -926,6 +926,9 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+    bool moe_cache_stats(struct llama_moe_cache_stats * out) const;
+    bool moe_cache_prefill(const char * path, llama_progress_callback progress, void * user_data);
+    bool moe_cache_save();
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
