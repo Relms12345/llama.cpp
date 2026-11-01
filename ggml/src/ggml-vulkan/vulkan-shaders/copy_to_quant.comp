@@ -286,6 +286,115 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
+#if defined(DATA_A_TURBO)
+// one block of 128 values per thread: normalize, rotate, nearest centroid, corrected norm
+#if DATA_A_TURBO == 2
+#define TURBO_C turbo_c2
+#define TURBO_M turbo_m2
+#define TURBO_NM 3
+#elif DATA_A_TURBO == 3
+#define TURBO_C turbo_c3
+#define TURBO_M turbo_m3
+#define TURBO_NM 7
+#elif DATA_A_TURBO == 4
+#define TURBO_C turbo_c4
+#define TURBO_M turbo_m4
+#define TURBO_NM 15
+#elif DATA_A_TURBO == 5
+#define TURBO_C turbo_c5
+#define TURBO_M turbo_m5
+#define TURBO_NM 31
+#else
+#define TURBO_C turbo_c6
+#define TURBO_M turbo_m6
+#define TURBO_NM 63
+#endif
+
+void quantize(uint dst_idx, uint src_idx)
+{
+    float r[QUANT_K_TURBO];
+
+    float sumsq = 0.0;
+    [[unroll]] for (uint j = 0; j < QUANT_K_TURBO; ++j) {
+        r[j] = float(data_s[src_idx + j]);
+        sumsq += r[j]*r[j];
+    }
+    const float norm = sqrt(sumsq);
+    const float inv  = norm > 1e-10 ? 1.0/norm : 0.0;
+
+    [[unroll]] for (uint j = 0; j < QUANT_K_TURBO; ++j) {
+        r[j] *= inv*turbo_s1[j];
+    }
+    [[unroll]] for (uint h = 1; h < QUANT_K_TURBO; h *= 2) {
+        [[unroll]] for (uint i = 0; i < QUANT_K_TURBO; i += 2*h) {
+            [[unroll]] for (uint j = i; j < i + h; ++j) {
+                const float a = r[j];
+                const float b = r[j + h];
+                r[j]     = a + b;
+                r[j + h] = a - b;
+            }
+        }
+    }
+
+    // codes, packed into the 16-bit words as they are produced
+    uint qs[32];
+    uint qh[16];
+    [[unroll]] for (uint w = 0; w < 32; ++w) { qs[w] = 0; }
+    [[unroll]] for (uint w = 0; w < 16; ++w) { qh[w] = 0; }
+
+    float recon = 0.0;
+    for (uint j = 0; j < QUANT_K_TURBO; ++j) {
+        const float v = r[j]*TURBO_INV_SQRT_128*turbo_s2[j];
+        // number of midpoints <= v (binary search)
+        uint lo = 0;
+        uint hi = TURBO_NM;
+        while (lo < hi) {
+            const uint m = (lo + hi)/2;
+            if (v < TURBO_M[m]) {
+                hi = m;
+            } else {
+                lo = m + 1;
+            }
+        }
+        const uint code = lo;
+        recon += TURBO_C[code]*TURBO_C[code];
+#if DATA_A_TURBO == 2 || DATA_A_TURBO == 3
+        qs[j/8] |= (code & 3) << (2*(j%8));
+#if DATA_A_TURBO == 3
+        qh[j/16] |= (code >> 2) << (j%16);
+#endif
+#elif DATA_A_TURBO == 4
+        qs[j/4] |= code << (4*(j%4));
+#elif DATA_A_TURBO == 5
+        const uint neg = code < 16 ? 1 : 0;
+        const uint mag = code < 16 ? 15 - code : code - 16;
+        qs[j/4]  |= mag << (4*(j%4));
+        qh[j/16] |= neg << (j%16);
+#else
+        qs[j/4] |= (code & 0xF) << (4*(j%4));
+        qh[j/8] |= (code >> 4) << (2*(j%8));
+#endif
+    }
+    recon = sqrt(recon);
+    data_q[dst_idx].norm = float16_t(recon > 1e-10 ? norm/recon : norm);
+
+#if DATA_A_TURBO == 2
+    [[unroll]] for (uint w = 0; w < 16; ++w) { data_q[dst_idx].qs[w] = uint16_t(qs[w]); }
+#elif DATA_A_TURBO == 3
+    [[unroll]] for (uint w = 0; w < 16; ++w) { data_q[dst_idx].qs[w]    = uint16_t(qs[w]); }
+    [[unroll]] for (uint w = 0; w <  8; ++w) { data_q[dst_idx].signs[w] = uint16_t(qh[w]); }
+#elif DATA_A_TURBO == 4
+    [[unroll]] for (uint w = 0; w < 32; ++w) { data_q[dst_idx].qs[w] = uint16_t(qs[w]); }
+#elif DATA_A_TURBO == 5
+    [[unroll]] for (uint w = 0; w < 32; ++w) { data_q[dst_idx].qs[w] = uint16_t(qs[w]); }
+    [[unroll]] for (uint w = 0; w <  8; ++w) { data_q[dst_idx].qh[w] = uint16_t(qh[w]); }
+#else
+    [[unroll]] for (uint w = 0; w < 32; ++w) { data_q[dst_idx].qs[w] = uint16_t(qs[w]); }
+    [[unroll]] for (uint w = 0; w < 16; ++w) { data_q[dst_idx].qh[w] = uint16_t(qh[w]); }
+#endif
+}
+#endif
+
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 void quantize(uint dst_idx, uint src_idx)
 {
