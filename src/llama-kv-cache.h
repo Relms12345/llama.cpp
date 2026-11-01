@@ -274,6 +274,9 @@ private:
     // SWA
     const uint32_t n_swa = 0;
 
+    // a layer has a TurboQuant K cache (its rotated domain does not allow a K-shift)
+    bool has_turbo_k = false;
+
     // env: LLAMA_ATTN_ROT_DISABLE
     uint32_t n_rot_k = 0;
     uint32_t n_rot_v = 0;
