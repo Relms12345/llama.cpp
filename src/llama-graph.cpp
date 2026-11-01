@@ -2904,6 +2904,20 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                  int   il) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
+    // TurboQuant K/V cache: the cache holds rotated vectors, heads zero-padded to a multiple of 128.
+    // Q gets the same padding and rotation (the scores are unchanged), and the output is rotated back.
+    const bool k_turbo = ggml_is_turbo(k->type);
+    const bool v_turbo = ggml_is_turbo(v->type);
+    const int64_t n_embd_head_v_out = v_turbo ? hparams.n_embd_head_v(il) : v->ne[0];
+    if (k_turbo) {
+        GGML_ASSERT(v_mla == nullptr);
+        if (q->ne[0] < k->ne[0]) {
+            q = ggml_pad(ctx0, q, k->ne[0] - q->ne[0], 0, 0, 0);
+        }
+        q = ggml_turbo_wht(ctx0, q, 0);
+        cb(q, "q_turbo", il);
+    }
+
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
 
@@ -2943,6 +2957,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
+
+        if (v_turbo) {
+            // [n_embd_head_v (padded), n_head, n_tokens, n_stream]
+            cur = ggml_turbo_wht(ctx0, cur, 1);
+            if (cur->ne[0] > n_embd_head_v_out) {
+                cur = ggml_view_4d(ctx0, cur, n_embd_head_v_out, cur->ne[1], cur->ne[2], cur->ne[3], cur->nb[1], cur->nb[2], cur->nb[3], 0);
+                cur = ggml_cont(ctx0, cur);
+            }
+            cb(cur, "fattn_turbo", il);
+        }
 
         if (v_mla) {
 #if 0
@@ -3003,12 +3027,25 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         if (!v_trans) {
             // note: avoid this branch
+            if (v_turbo) {
+                // the blocks of a turbo cache cannot be transposed
+                v = ggml_cast(ctx0, v, GGML_TYPE_F32);
+            }
             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
             cb(v, "v_cont", il);
         }
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
         cb(kqv, "kqv", il);
+
+        if (v_turbo) {
+            // [n_embd_head_v (padded), n_tokens, n_head, n_stream]
+            kqv = ggml_turbo_wht(ctx0, kqv, 1);
+            if (kqv->ne[0] > n_embd_head_v_out) {
+                kqv = ggml_view_4d(ctx0, kqv, n_embd_head_v_out, kqv->ne[1], kqv->ne[2], kqv->ne[3], kqv->nb[1], kqv->nb[2], kqv->nb[3], 0);
+            }
+            cb(kqv, "kqv_turbo", il);
+        }
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {
