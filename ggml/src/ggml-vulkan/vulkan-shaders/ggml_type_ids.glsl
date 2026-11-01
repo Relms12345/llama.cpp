@@ -30,5 +30,10 @@
 #define GGML_TYPE_NVFP4   40u
 #define GGML_TYPE_Q1_0    41u
 #define GGML_TYPE_Q2_0    42u
+#define GGML_TYPE_TURBO3_0 44u
+#define GGML_TYPE_TURBO4_0 47u
+#define GGML_TYPE_TURBO5_0 51u
+#define GGML_TYPE_TURBO6_0 52u
+#define GGML_TYPE_TURBO2_0 53u
 
 #endif // !defined(GGML_TYPE_IDS_COMP)

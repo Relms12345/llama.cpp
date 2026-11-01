@@ -1335,6 +1335,11 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
     FaCodePath path = device->coopmat2 ? FA_COOPMAT2 :
                       device->coopmat1_fa_support ? FA_COOPMAT1 : FA_SCALAR;
 
+    // TurboQuant K/V decode only in the scalar shader
+    if (ggml_is_turbo(k_type) || ggml_is_turbo(v_type)) {
+        path = FA_SCALAR;
+    }
+
     if (path == FA_COOPMAT2 && k_type == GGML_TYPE_BF16 && !device->coopmat2_bf16_support) {
         path = FA_COOPMAT1;
     }
@@ -3333,7 +3338,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q5_0], "set_rows_" #src "_q5_0" #itype, set_rows_ ## src ## _q5_0 ## itype ## _len, set_rows_ ## src ## _q5_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q5_1], "set_rows_" #src "_q5_1" #itype, set_rows_ ## src ## _q5_1 ## itype ## _len, set_rows_ ## src ## _q5_1 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q8_0], "set_rows_" #src "_q8_0" #itype, set_rows_ ## src ## _q8_0 ## itype ## _len, set_rows_ ## src ## _q8_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_IQ4_NL], "set_rows_" #src "_iq4_nl" #itype, set_rows_ ## src ## _iq4_nl ## itype ## _len, set_rows_ ## src ## _iq4_nl ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_IQ4_NL], "set_rows_" #src "_iq4_nl" #itype, set_rows_ ## src ## _iq4_nl ## itype ## _len, set_rows_ ## src ## _iq4_nl ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_TURBO2_0], "set_rows_" #src "_turbo2_0" #itype, set_rows_ ## src ## _turbo2_0 ## itype ## _len, set_rows_ ## src ## _turbo2_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_TURBO3_0], "set_rows_" #src "_turbo3_0" #itype, set_rows_ ## src ## _turbo3_0 ## itype ## _len, set_rows_ ## src ## _turbo3_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_TURBO4_0], "set_rows_" #src "_turbo4_0" #itype, set_rows_ ## src ## _turbo4_0 ## itype ## _len, set_rows_ ## src ## _turbo4_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_TURBO5_0], "set_rows_" #src "_turbo5_0" #itype, set_rows_ ## src ## _turbo5_0 ## itype ## _len, set_rows_ ## src ## _turbo5_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_TURBO6_0], "set_rows_" #src "_turbo6_0" #itype, set_rows_ ## src ## _turbo6_0 ## itype ## _len, set_rows_ ## src ## _turbo6_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
 
     SET_ROWS(0, f32, _i32)
     SET_ROWS(0, f32, _i64)
@@ -3590,6 +3600,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ++idx;
         }
     }
+
+    ggml_vk_create_pipeline(device, device->pipeline_turbo_wht_f32, "turbo_wht_f32", turbo_wht_f32_len, turbo_wht_f32_data, "main", 2, sizeof(vk_op_turbo_wht_push_constants), {1, 1, 1}, {}, 1);
 
     const uint32_t cumsum_elem_per_thread = (device->vendor_id == VK_VENDOR_ID_AMD || device->vendor_id == VK_VENDOR_ID_INTEL) ? 2 : 4;
     ggml_vk_create_pipeline(device, device->pipeline_cumsum_f32,       "cumsum_f32", cumsum_f32_len, cumsum_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { 256, device->subgroup_size, cumsum_elem_per_thread }, 1, true, true, device->subgroup_size);
@@ -7234,6 +7246,30 @@ void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
 
 static uint32_t ggml_vk_nb_elem(const ggml_tensor * t, int i) {
     return (uint32_t)(t->nb[i] / ggml_type_size(t->type));
+}
+
+void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    vk_pipeline pipeline = ctx->device->pipeline_turbo_wht_f32;
+    GGML_ASSERT(pipeline != nullptr);
+
+    const uint32_t ne0g     = (uint32_t)(src0->ne[0] / 128);
+    const uint32_t n_groups = (uint32_t)(ggml_nelements(src0) / 128);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_subbuffer src_buf = ggml_vk_tensor_subbuffer(ctx, src0, true);
+    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst,  true);
+
+    vk_op_turbo_wht_push_constants pc = {
+        n_groups, ne0g, (uint32_t)src0->ne[1], (uint32_t)src0->ne[2],
+        ggml_vk_nb_elem(src0, 1), ggml_vk_nb_elem(src0, 2), ggml_vk_nb_elem(src0, 3),
+        0, 0,
+        (uint32_t)ggml_get_op_params_i32(dst, 0),
+    };
+    init_pushconst_tensor_offsets(ctx, pc, src0, nullptr, nullptr, nullptr, dst);
+
+    const uint32_t n_wg = std::min(n_groups, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { n_wg, 1, 1 });
 }
 
 void ggml_vk_dsv4_hc_comb(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * mixes, const ggml_tensor * scale, const ggml_tensor * base, ggml_tensor * dst) {
@@ -12766,6 +12802,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         ggml_vk_cumsum(ctx, compute_ctx, src0, node);
 
         break;
+    case GGML_OP_TURBO_WHT:
+        ggml_vk_turbo_wht(ctx, compute_ctx, src0, node);
+
+        break;
     case GGML_OP_DSV4_HC_COMB:
         ggml_vk_dsv4_hc_comb(ctx, compute_ctx, src0, src1, src2, node);
 
@@ -15683,6 +15723,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_TURBO2_0:
+                    case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO4_0:
+                    case GGML_TYPE_TURBO5_0:
+                    case GGML_TYPE_TURBO6_0:
                         return true;
                     default:
                         return false;
@@ -15696,6 +15741,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 if (!coopmat2 && !(device->subgroup_shuffle && device->subgroup_vote)) {
                     // scalar/coopmat1 FA uses subgroupShuffle/subgroupAll
+                    return false;
+                }
+                // TurboQuant K/V always use the scalar shader
+                if ((ggml_is_turbo(op->src[1]->type) || ggml_is_turbo(op->src[2]->type)) &&
+                    !(device->subgroup_shuffle && device->subgroup_vote)) {
                     return false;
                 }
                 return true;
@@ -15757,6 +15807,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_TURBO2_0:
+                    case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO4_0:
+                    case GGML_TYPE_TURBO5_0:
+                    case GGML_TYPE_TURBO6_0:
                         return true;
                     default:
                         return false;
@@ -15954,6 +16009,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return false;
             }
+        case GGML_OP_TURBO_WHT:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 128 == 0 &&
+                   op->src[0]->nb[0] == sizeof(float) && ggml_is_contiguous(op) &&
+                   device->pipeline_turbo_wht_f32 != nullptr;
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:

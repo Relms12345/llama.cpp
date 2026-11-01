@@ -2750,6 +2750,10 @@ struct test_set_rows : public test_case {
     }
 
     double max_nmse_err() override {
+        if (ggml_is_turbo(type_dst)) {
+            // backends may round the norms and the rotation differently: rare off-by-one codes
+            return 1e-4;
+        }
         if (type_dst == GGML_TYPE_Q2_0 || type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 ||
             type_dst == GGML_TYPE_IQ4_NL ||
             type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
@@ -2789,6 +2793,32 @@ struct test_set_rows : public test_case {
             }
         }
         return test_case::max_nmse_err(backend);
+    }
+};
+
+// GGML_OP_TURBO_WHT
+struct test_turbo_wht : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int direction;
+    const bool v; // non-contiguous rows
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, direction, v);
+    }
+
+    test_turbo_wht(std::array<int64_t, 4> ne = {128, 4, 3, 1}, int direction = 0, bool v = false)
+        : ne(ne), direction(direction), v(v) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1]*(v ? 2 : 1), ne[2], ne[3]);
+        ggml_set_name(a, "a");
+        if (v) {
+            a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1]*2, a->nb[2], a->nb[3], 0);
+            ggml_set_name(a, "view_of_a");
+        }
+        ggml_tensor * out = ggml_turbo_wht(ctx, a, direction);
+        ggml_set_name(out, "out");
+        return out;
     }
 };
 
@@ -10297,6 +10327,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // TurboQuant KV cache types (not in all_types: they only support SET_ROWS, FLASH_ATTN_EXT and dequantization)
+    for (ggml_type src_type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (ggml_type type : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO6_0}) {
+            for (bool v : {false, true}) {
+                test_cases.emplace_back(new test_set_rows(src_type, type, GGML_TYPE_I64, { 256, 5, 1, 3 }, { 1, 1, }, 1, v));
+                test_cases.emplace_back(new test_set_rows(src_type, type, GGML_TYPE_I32, { 384, 11, 2, 1 }, { 2, 3, }, 7, v));
+            }
+        }
+    }
+    for (int direction : {0, 1}) {
+        for (bool v : {false, true}) {
+            test_cases.emplace_back(new test_turbo_wht({128, 4, 3, 1}, direction, v));
+            test_cases.emplace_back(new test_turbo_wht({384, 7, 2, 2}, direction, v));
+        }
+    }
+    test_cases.emplace_back(new test_turbo_wht({256, 70000, 1, 1}, 0, false)); // more groups than the max workgroup count
+
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
@@ -12283,6 +12330,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 17, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // TurboQuant K/V (the graph pads the heads to 128 and rotates Q and the output; the kernels see rotated data)
+    for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO6_0}) {
+        for (ggml_type type_V : {GGML_TYPE_F16, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO6_0}) {
+            if (!ggml_is_turbo(type_K) && !ggml_is_turbo(type_V)) {
+                continue;
+            }
+            const bool same = type_K == type_V || !ggml_is_turbo(type_K) || !ggml_is_turbo(type_V);
+            for (int64_t hs : {128, 256}) {
+                for (int64_t nr2 : {1, 4}) {
+                    for (int64_t nb : {1, 3, 32}) {
+                        if (!same && (hs != 128 || nb == 32)) continue;
+                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {nr2, 1}, nb == 1 ? 1024 : 113, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+                    }
+                }
+            }
+        }
+    }
 
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));

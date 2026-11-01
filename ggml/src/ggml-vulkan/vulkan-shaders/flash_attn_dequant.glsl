@@ -33,6 +33,19 @@ layout (binding = 2) readonly buffer V_PACKED_IQ4_NL { block_iq4_nl_packed16 dat
 layout (binding = 1) readonly buffer K_PACKED_BF16 { u16vec4 data[]; } k_packed_bf16;
 layout (binding = 2) readonly buffer V_PACKED_BF16 { u16vec4 data[]; } v_packed_bf16;
 
+#include "turbo_common.glsl"
+
+layout (binding = 1) readonly buffer K_PACKED_TURBO2 { block_turbo2_0_packed16 data[]; } k_packed_turbo2;
+layout (binding = 2) readonly buffer V_PACKED_TURBO2 { block_turbo2_0_packed16 data[]; } v_packed_turbo2;
+layout (binding = 1) readonly buffer K_PACKED_TURBO3 { block_turbo3_0_packed16 data[]; } k_packed_turbo3;
+layout (binding = 2) readonly buffer V_PACKED_TURBO3 { block_turbo3_0_packed16 data[]; } v_packed_turbo3;
+layout (binding = 1) readonly buffer K_PACKED_TURBO4 { block_turbo4_0_packed16 data[]; } k_packed_turbo4;
+layout (binding = 2) readonly buffer V_PACKED_TURBO4 { block_turbo4_0_packed16 data[]; } v_packed_turbo4;
+layout (binding = 1) readonly buffer K_PACKED_TURBO5 { block_turbo5_0_packed16 data[]; } k_packed_turbo5;
+layout (binding = 2) readonly buffer V_PACKED_TURBO5 { block_turbo5_0_packed16 data[]; } v_packed_turbo5;
+layout (binding = 1) readonly buffer K_PACKED_TURBO6 { block_turbo6_0_packed16 data[]; } k_packed_turbo6;
+layout (binding = 2) readonly buffer V_PACKED_TURBO6 { block_turbo6_0_packed16 data[]; } v_packed_turbo6;
+
 // Q4_1 and Q5_1 packed32 views: aliased to the same memory as the packed16
 // views, used by the MMQ K-side hot path for fast 4-uint loads.
 layout (binding = 1) readonly buffer K_PACKED_Q4_1_P32 { block_q4_1_packed32 data[]; } k_packed_q4_1_p32;
@@ -118,6 +131,47 @@ layout (binding = 1) readonly buffer K_PACKED_Q5_1_P32 { block_q5_1_packed32 dat
 #define FA_DEQUANT4_BF16(BUF) \
     return FLOAT_TYPEV4(bf16_to_fp32(uvec4(BUF.data[(a_offset + ib) / 4])));
 
+// TurboQuant: the 4 values iqs..iqs+3 (iqs % 4 == 0) of a 128-value block, centroid * norm
+#define FA_DEQUANT4_TURBO2(BUF) {                                                                 \
+    const uint w = uint(BUF.data[a_offset + ib].qs[iqs / 8]) >> (2 * (iqs % 8));                  \
+    const float n = float(BUF.data[a_offset + ib].norm);                                          \
+    return FLOAT_TYPEV4(vec4(turbo_c2[w & 3], turbo_c2[(w >> 2) & 3],                             \
+                             turbo_c2[(w >> 4) & 3], turbo_c2[(w >> 6) & 3]) * n);                \
+}
+
+#define FA_DEQUANT4_TURBO3(BUF) {                                                                 \
+    const uint w = uint(BUF.data[a_offset + ib].qs[iqs / 8]) >> (2 * (iqs % 8));                  \
+    const uint h = (uint(BUF.data[a_offset + ib].signs[iqs / 16]) >> (iqs % 16)) << 2;            \
+    const float n = float(BUF.data[a_offset + ib].norm);                                          \
+    return FLOAT_TYPEV4(vec4(turbo_c3[(w & 3) | (h & 4)], turbo_c3[((w >> 2) & 3) | ((h >> 1) & 4)], \
+                             turbo_c3[((w >> 4) & 3) | ((h >> 2) & 4)], turbo_c3[((w >> 6) & 3) | ((h >> 3) & 4)]) * n); \
+}
+
+#define FA_DEQUANT4_TURBO4(BUF) {                                                                 \
+    const uint w = uint(BUF.data[a_offset + ib].qs[iqs / 4]);                                     \
+    const float n = float(BUF.data[a_offset + ib].norm);                                          \
+    return FLOAT_TYPEV4(vec4(turbo_c4[w & 0xF], turbo_c4[(w >> 4) & 0xF],                         \
+                             turbo_c4[(w >> 8) & 0xF], turbo_c4[(w >> 12) & 0xF]) * n);           \
+}
+
+#define FA_DEQUANT4_TURBO5(BUF) {                                                                 \
+    const uint w = uint(BUF.data[a_offset + ib].qs[iqs / 4]);                                     \
+    const uint s = uint(BUF.data[a_offset + ib].qh[iqs / 16]) >> (iqs % 16);                      \
+    const float n = float(BUF.data[a_offset + ib].norm);                                          \
+    const vec4 m = vec4(turbo_c5[16 + (w & 0xF)], turbo_c5[16 + ((w >> 4) & 0xF)],                \
+                        turbo_c5[16 + ((w >> 8) & 0xF)], turbo_c5[16 + ((w >> 12) & 0xF)]);       \
+    const vec4 sg = vec4(1.0) - 2.0 * vec4(s & 1, (s >> 1) & 1, (s >> 2) & 1, (s >> 3) & 1);      \
+    return FLOAT_TYPEV4(m * sg * n);                                                              \
+}
+
+#define FA_DEQUANT4_TURBO6(BUF) {                                                                 \
+    const uint w = uint(BUF.data[a_offset + ib].qs[iqs / 4]);                                     \
+    const uint h = uint(BUF.data[a_offset + ib].qh[iqs / 8]) >> (2 * (iqs % 8));                  \
+    const float n = float(BUF.data[a_offset + ib].norm);                                          \
+    return FLOAT_TYPEV4(vec4(turbo_c6[(w & 0xF) | ((h & 3) << 4)], turbo_c6[((w >> 4) & 0xF) | (((h >> 2) & 3) << 4)], \
+                             turbo_c6[((w >> 8) & 0xF) | (((h >> 4) & 3) << 4)], turbo_c6[((w >> 12) & 0xF) | (((h >> 6) & 3) << 4)]) * n); \
+}
+
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     if (binding_idx == BINDING_IDX_K) {
         switch (FaTypeK) {
@@ -129,6 +183,11 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case GGML_TYPE_Q8_0: FA_DEQUANT4_Q8_0(k_packed_q8_0)
             case GGML_TYPE_IQ4_NL: FA_DEQUANT4_IQ4_NL(k_packed_iq4_nl)
             case GGML_TYPE_BF16: FA_DEQUANT4_BF16(k_packed_bf16)
+            case GGML_TYPE_TURBO2_0: FA_DEQUANT4_TURBO2(k_packed_turbo2)
+            case GGML_TYPE_TURBO3_0: FA_DEQUANT4_TURBO3(k_packed_turbo3)
+            case GGML_TYPE_TURBO4_0: FA_DEQUANT4_TURBO4(k_packed_turbo4)
+            case GGML_TYPE_TURBO5_0: FA_DEQUANT4_TURBO5(k_packed_turbo5)
+            case GGML_TYPE_TURBO6_0: FA_DEQUANT4_TURBO6(k_packed_turbo6)
         }
     } else {
         switch (FaTypeV) {
@@ -140,6 +199,11 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case GGML_TYPE_Q8_0: FA_DEQUANT4_Q8_0(v_packed_q8_0)
             case GGML_TYPE_IQ4_NL: FA_DEQUANT4_IQ4_NL(v_packed_iq4_nl)
             case GGML_TYPE_BF16: FA_DEQUANT4_BF16(v_packed_bf16)
+            case GGML_TYPE_TURBO2_0: FA_DEQUANT4_TURBO2(v_packed_turbo2)
+            case GGML_TYPE_TURBO3_0: FA_DEQUANT4_TURBO3(v_packed_turbo3)
+            case GGML_TYPE_TURBO4_0: FA_DEQUANT4_TURBO4(v_packed_turbo4)
+            case GGML_TYPE_TURBO5_0: FA_DEQUANT4_TURBO5(v_packed_turbo5)
+            case GGML_TYPE_TURBO6_0: FA_DEQUANT4_TURBO6(v_packed_turbo6)
         }
     }
     return FLOAT_TYPEV4(0);

@@ -1,0 +1,61 @@
+#version 450
+
+// GGML_OP_TURBO_WHT: rotation of each group of 128 values along ne[0]
+//   forward (direction 0): x -> s2 * (H * (s1 * x)) / sqrt(128)
+//   inverse (direction 1): x -> s1 * (H * (s2 * x)) / sqrt(128)
+// One workgroup of 128 invocations per group, the butterflies in shared memory.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "turbo_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_groups;  // total number of 128-value groups
+    uint ne0g;      // groups per row (ne0 / 128)
+    uint ne1;
+    uint ne2;
+    uint nb01;      // source strides, in floats
+    uint nb02;
+    uint nb03;
+    uint a_offset;  // in floats
+    uint d_offset;
+    uint direction;
+} p;
+
+layout(binding = 0) readonly  buffer A { float data_a[]; };
+layout(binding = 1) writeonly buffer D { float data_d[]; };
+
+shared float sh[128];
+
+void main() {
+    const uint t = gl_LocalInvocationID.x;
+
+    for (uint g = gl_WorkGroupID.x; g < p.n_groups; g += gl_NumWorkGroups.x) {
+        const uint ig  = g % p.ne0g;
+        const uint ir  = g / p.ne0g;
+        const uint i1  = ir % p.ne1;
+        const uint i2  = (ir / p.ne1) % p.ne2;
+        const uint i3  = ir / (p.ne1*p.ne2);
+
+        const uint src = p.a_offset + i1*p.nb01 + i2*p.nb02 + i3*p.nb03 + 128*ig + t;
+        const uint dst = p.d_offset + 128*g + t;
+
+        const float sa = p.direction == 0 ? turbo_s1[t] : turbo_s2[t];
+        const float sb = p.direction == 0 ? turbo_s2[t] : turbo_s1[t];
+
+        float v = data_a[src]*sa;
+
+        [[unroll]] for (uint h = 1; h < 128; h *= 2) {
+            sh[t] = v;
+            barrier();
+            const float o = sh[t ^ h];
+            barrier();
+            v = (t & h) == 0 ? v + o : o - v;
+        }
+
+        data_d[dst] = v*(TURBO_INV_SQRT_128*sb);
+    }
+}
