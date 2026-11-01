@@ -37,6 +37,29 @@ extern "C" {
     GGML_BACKEND_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
 
+    // Live process-global MoE expert prefetch hints. GGML_CPU_MOE_PREFETCH sets the initial default only.
+    GGML_BACKEND_API void ggml_cpu_set_moe_prefetch(bool enabled);
+
+    // File-backed routed experts of a MUL_MAT_ID weight. One worker per node pins the experts it needs,
+    // all workers compute them, then the same worker releases them. Register before computing graphs
+    // that use the tensor and unregister (provider = NULL) only after they are done.
+    struct ggml_cpu_moe_stream {
+        void * context;
+        // pin experts[0..k) for the largest k >= 1 that fits and store their data; returns k, 0 on failure
+        int  (*acquire)(void * context, const int32_t * experts, int n, const void ** data);
+        void (*release)(void * context, const int32_t * experts, int n);
+        void (*prefetch)(void * context, int64_t expert); // optional hint, no allocation
+        bool repacked; // data is in the CPU_REPACK layout of the tensor
+    };
+    GGML_BACKEND_API bool ggml_cpu_register_moe_stream(
+            const struct ggml_tensor * tensor, const struct ggml_cpu_moe_stream * provider);
+    GGML_BACKEND_API const struct ggml_cpu_moe_stream * ggml_cpu_get_moe_stream(const struct ggml_tensor * tensor);
+
+    // In-place CPU_REPACK of one expert slice, using work_size bytes of scratch after it.
+    // A zero work size means there is no repack kernel for this type, shape or CPU.
+    GGML_BACKEND_API size_t ggml_cpu_moe_repack_work_size(const struct ggml_tensor * tensor);
+    GGML_BACKEND_API bool   ggml_cpu_moe_repack(const struct ggml_tensor * tensor, void * data, void * scratch);
+
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);
 
@@ -60,6 +83,8 @@ extern "C" {
     GGML_BACKEND_API int                           ggml_threadpool_get_n_threads (struct ggml_threadpool * threadpool);
     GGML_BACKEND_API void                          ggml_threadpool_pause         (struct ggml_threadpool * threadpool);
     GGML_BACKEND_API void                          ggml_threadpool_resume        (struct ggml_threadpool * threadpool);
+    // Human-readable CPU affinity state of the last created CPU threadpool.
+    GGML_BACKEND_API void ggml_cpu_get_affinity_status(char * text, size_t size);
 
     // ggml_graph_plan() has to be called before ggml_graph_compute()
     // when plan.work_size > 0, caller must allocate memory for plan.work_data

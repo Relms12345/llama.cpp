@@ -6,7 +6,9 @@
 #include "ggml-impl.h"
 #include "amx/amx.h"
 
+#include <atomic>
 #include <cctype>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -36,6 +38,74 @@
 #    include <sys/sysctl.h>
 #    include <sys/types.h>
 #endif
+
+// Streamed MoE expert providers: an open addressing table that compute threads read without locks.
+// Keys are never cleared, a removed entry keeps its key with a null provider and the slot is reused.
+namespace {
+constexpr size_t moe_stream_slots = 4096;
+std::atomic<const ggml_tensor *>         moe_stream_keys[moe_stream_slots];
+std::atomic<const ggml_cpu_moe_stream *> moe_stream_values[moe_stream_slots];
+std::atomic<int>                         moe_stream_count{0};
+std::mutex                               moe_stream_mutex; // writers only
+
+size_t moe_stream_hash(const ggml_tensor * tensor) {
+    uint64_t x = (uint64_t) (uintptr_t) tensor;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdull;
+    x ^= x >> 33;
+    return (size_t) x;
+}
+}
+
+bool ggml_cpu_register_moe_stream(const ggml_tensor * tensor, const ggml_cpu_moe_stream * provider) {
+    std::lock_guard<std::mutex> lock(moe_stream_mutex);
+    size_t reuse = moe_stream_slots;
+    for (size_t i = 0, h = moe_stream_hash(tensor); i < moe_stream_slots; i++) {
+        const size_t slot = (h + i) % moe_stream_slots;
+        const ggml_tensor * key = moe_stream_keys[slot].load(std::memory_order_relaxed);
+        if (key == tensor) {
+            const bool had = moe_stream_values[slot].load(std::memory_order_relaxed) != nullptr;
+            moe_stream_values[slot].store(provider, std::memory_order_release);
+            moe_stream_count.fetch_add((provider != nullptr) - had, std::memory_order_relaxed);
+            return true;
+        }
+        if (reuse == moe_stream_slots && (key == nullptr || moe_stream_values[slot].load(std::memory_order_relaxed) == nullptr)) {
+            reuse = slot;
+        }
+        if (key == nullptr) {
+            break;
+        }
+    }
+    if (!provider) {
+        return true;
+    }
+    if (reuse == moe_stream_slots) {
+        return false;
+    }
+    // readers probing for another key skip this slot either way, so it can be rekeyed in place
+    moe_stream_values[reuse].store(nullptr, std::memory_order_relaxed);
+    moe_stream_keys[reuse].store(tensor, std::memory_order_release);
+    moe_stream_values[reuse].store(provider, std::memory_order_release);
+    moe_stream_count.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+const ggml_cpu_moe_stream * ggml_cpu_get_moe_stream(const ggml_tensor * tensor) {
+    if (moe_stream_count.load(std::memory_order_relaxed) == 0) {
+        return nullptr;
+    }
+    for (size_t i = 0, h = moe_stream_hash(tensor); i < moe_stream_slots; i++) {
+        const size_t slot = (h + i) % moe_stream_slots;
+        const ggml_tensor * key = moe_stream_keys[slot].load(std::memory_order_acquire);
+        if (key == tensor) {
+            return moe_stream_values[slot].load(std::memory_order_acquire);
+        }
+        if (key == nullptr) {
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
 
 // ggml-backend interface
 

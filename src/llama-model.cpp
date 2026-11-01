@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-moe-stream.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1286,6 +1287,10 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+    // CPU expert streaming; destroyed before the tensor metadata and mappings it refers to
+    std::unique_ptr<llama_moe_stream> moe_stream;
+    uint64_t moe_cache_budget   = 0; // requested budget
+    uint64_t moe_resident_bytes = 0; // all experts fit the budget: loaded normally, nothing streamed
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1611,6 +1616,31 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool use_mmap_buffer = true;
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
+    if (params.moe_cache_bytes) {
+        // when every routed expert fits the budget there is nothing to stream: load them normally,
+        // which keeps the regular kernels (repacked weights, KleidiAI, fusions) and their speed
+        uint64_t expert_bytes = 0;
+        for (const auto & [name, w] : ml.weights_map) {
+            if (name.size() > 12 && name.compare(name.size() - 12, 12, "_exps.weight") == 0) {
+                expert_bytes += ggml_nbytes(w.tensor);
+            }
+        }
+        pimpl->moe_cache_budget = params.moe_cache_bytes;
+        if (expert_bytes == 0) {
+            throw std::runtime_error("CPU MoE streaming requested, but this model has no routed expert tensors");
+        }
+        if (expert_bytes <= params.moe_cache_bytes) {
+            pimpl->moe_resident_bytes = expert_bytes;
+            LLAMA_LOG_INFO("%s: all %.1f MiB of routed experts fit the %.1f MiB expert cache, loading them resident\n",
+                    __func__, expert_bytes / 1048576.0, params.moe_cache_bytes / 1048576.0);
+        } else {
+            if (use_mlock || params.check_tensors || (n_gpu_layers > 0 && !devices.empty())) {
+                throw std::runtime_error("CPU MoE streaming requires CPU-only weights, no mlock, and no eager tensor validation");
+            }
+            pimpl->moe_stream = std::make_unique<llama_moe_stream>(params.moe_cache_bytes);
+            ml.moe_stream = pimpl->moe_stream.get();
+        }
+    }
 
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         for (const auto & dev : devices) {
@@ -2057,6 +2087,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         });
     }
 
+    if (pimpl->moe_stream && pimpl->moe_stream->backing_bytes() == 0) {
+        throw std::runtime_error("CPU MoE streaming requested, but this model has no routed expert tensors");
+    }
+
     // load tensor data
     for (auto & [ctx, bufs] : ctx_bufs) {
         if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
@@ -2478,7 +2512,57 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
             }
         }
     }
+    if (pimpl->moe_stream) {
+        for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+            for (auto * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+                if (t->buffer && pimpl->moe_stream->contains(t)) {
+                    auto & bytes = ret[ggml_backend_buffer_get_type(t->buffer)];
+                    bytes -= std::min(bytes, ggml_nbytes(t));
+                }
+            }
+        }
+    }
     return ret;
+}
+
+bool llama_model::moe_cache_stats(struct llama_moe_cache_stats * out) const {
+    if (!out) {
+        return false;
+    }
+    *out = {};
+    if (pimpl->moe_stream) {
+        *out = pimpl->moe_stream->stats();
+    } else if (pimpl->moe_resident_bytes) {
+        out->capacity_bytes = pimpl->moe_cache_budget;
+        out->used_bytes     = pimpl->moe_resident_bytes;
+    }
+    return pimpl->moe_cache_budget != 0;
+}
+
+bool llama_model_get_moe_cache_stats(const llama_model * model, struct llama_moe_cache_stats * out) {
+    return model && model->moe_cache_stats(out);
+}
+
+bool llama_model::moe_cache_prefill(const char * path, llama_progress_callback progress, void * user_data) {
+    if (pimpl->moe_resident_bytes) {
+        return !progress || progress(1.0f, user_data); // already loaded
+    }
+    return pimpl->moe_stream && pimpl->moe_stream->prefill(path, progress, user_data);
+}
+
+bool llama_model::moe_cache_save() {
+    if (pimpl->moe_resident_bytes) {
+        return true;
+    }
+    return pimpl->moe_stream && pimpl->moe_stream->save_profile();
+}
+
+bool llama_model_moe_cache_prefill(llama_model * model, const char * path, llama_progress_callback progress, void * user_data) {
+    return model && model->moe_cache_prefill(path, progress, user_data);
+}
+
+bool llama_model_moe_cache_save(llama_model * model) {
+    return model && model->moe_cache_save();
 }
 
 uint64_t llama_model::n_elements() const {
@@ -3432,6 +3516,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.moe_cache_bytes             =*/ 0,
     };
 
     return result;

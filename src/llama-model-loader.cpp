@@ -1,4 +1,5 @@
 #include "llama-model-loader.h"
+#include "llama-moe-stream.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -1098,18 +1099,19 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     return ggml_backend_dev_buffer_type(cpu_dev);
 }
 
-bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
-    if (mode == LLAMA_LAZY_MODE_OFF) {
+bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool force) {
+    if (!force && mode == LLAMA_LAZY_MODE_OFF) {
         return false;
     }
 
     // do not lazy-read small tensors, it has significant overhead and is not worth it
     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
+    if (!force && mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
         return false;
     }
 
     if (!llama_mmap::SUPPORTED) {
+        if (force) throw std::runtime_error("CPU MoE streaming requires mmap support");
         LLAMA_LOG_WARN("%s: mmap is not available, so tensor %s (size = %zu MiB) is loaded into RAM in full\n",
                 __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
         return false;
@@ -1131,6 +1133,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
+    bool is_moe_stream = false;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         const ctx_key key { buft, is_lazy };
@@ -1219,6 +1222,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (tn.bid == -1) {
                 GGML_ABORT("repeating layer tensor %s used without a layer number", tn.str().c_str());
             }
+        }
+
+        if (moe_stream && op == GGML_OP_MUL_MAT_ID) {
+            if (files.empty()) throw std::runtime_error("CPU MoE streaming requires a GGUF backing file");
+            const auto & weight = require_weight(tn.str().c_str());
+            is_lazy = lazy.add(tn.str(), t_meta, &weight, true);
+            is_moe_stream = true;
         }
 
         if (is_lazy) {
@@ -1392,6 +1402,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
+    if (is_moe_stream && !no_alloc) {
+        const auto & weight = require_weight(tn.str().c_str());
+        if (files.at(weight.idx)->has_direct_io()) {
+            throw std::runtime_error("CPU MoE streaming requires buffered file I/O, not direct I/O");
+        }
+        moe_stream->add_tensor(tensor, files.at(weight.idx)->file_id(), weight.offs);
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);

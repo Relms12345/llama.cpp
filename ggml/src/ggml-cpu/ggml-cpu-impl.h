@@ -29,6 +29,28 @@ struct ggml_compute_params {
     bool use_ref;
 };
 
+// Streamed MoE experts (ggml_cpu_moe_stream) for the MUL_MAT_ID kernels: thread 0 lists the experts with
+// rows and pins the first group before the kernel's barrier, every worker computes the experts
+// [begin, group->end) and then calls ggml_cpu_moe_group_next until it returns -1. A failed pin
+// fails the graph (GGML_STATUS_FAILED).
+struct ggml_cpu_moe_group {
+    int32_t n;      // experts with rows
+    int32_t end;    // end of the pinned group
+    int32_t failed;
+    int32_t pad;
+};
+struct ggml_cpu_moe_stream;
+int32_t *     ggml_cpu_moe_group_ids (struct ggml_cpu_moe_group * g);
+const void ** ggml_cpu_moe_group_data(struct ggml_cpu_moe_group * g, int64_t n_as);
+void    ggml_cpu_moe_stream_fail(struct ggml_threadpool * threadpool);
+size_t  ggml_cpu_moe_group_size(int64_t n_as);
+void    ggml_cpu_moe_group_init(struct ggml_cpu_moe_group * g, const struct ggml_cpu_moe_stream * stream,
+                                struct ggml_threadpool * tp, const int64_t * counts, int64_t n_as);
+void    ggml_cpu_moe_group_pin (struct ggml_cpu_moe_group * g, const struct ggml_cpu_moe_stream * stream,
+                                struct ggml_threadpool * tp, int64_t n_as, int32_t begin);
+int32_t ggml_cpu_moe_group_next(struct ggml_cpu_moe_group * g, const struct ggml_cpu_moe_stream * stream,
+                                const struct ggml_compute_params * params, int64_t n_as, int32_t begin);
+
 
 #if defined(_MSC_VER)
 

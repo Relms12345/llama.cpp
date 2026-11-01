@@ -508,6 +508,7 @@ struct ggml_threadpool {
     atomic_bool stop;         // Used for stopping the threadpool altogether
     atomic_bool pause;        // Used for pausing the threadpool or individual threads
     atomic_int  abort;        // Used for aborting processing of a graph
+    atomic_bool failed;       // provider I/O/allocation failure, distinct from user cancellation
 
     struct ggml_compute_state * workers;   // per thread state
     int          n_threads;   // Number of threads in the pool
@@ -517,6 +518,10 @@ struct ggml_threadpool {
 
     enum ggml_status ec;
 };
+
+void ggml_cpu_moe_stream_fail(struct ggml_threadpool * threadpool) {
+    atomic_store_explicit(&threadpool->failed, true, memory_order_relaxed);
+}
 
 // Per-thread state
 struct ggml_compute_state {
@@ -528,6 +533,7 @@ struct ggml_compute_state {
     bool cpumask[GGML_MAX_N_THREADS];
     struct ggml_threadpool * threadpool;
     int ith;
+    int affinity_status; // 0 pending, 1 applied, 2 unrestricted, -1 failed
 };
 
 // Helpers for polling loops
@@ -1565,6 +1571,68 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// Streamed experts (see ggml_cpu_moe_stream): the experts with rows, in order, and the pinned group
+
+size_t ggml_cpu_moe_group_size(int64_t n_as) {
+    return sizeof(struct ggml_cpu_moe_group) + n_as*(sizeof(int32_t) + sizeof(void *)) + sizeof(void *);
+}
+
+int32_t * ggml_cpu_moe_group_ids(struct ggml_cpu_moe_group * g) {
+    return (int32_t *) (g + 1);
+}
+
+const void ** ggml_cpu_moe_group_data(struct ggml_cpu_moe_group * g, int64_t n_as) {
+    return (const void **) GGML_PAD((uintptr_t) (ggml_cpu_moe_group_ids(g) + n_as), sizeof(void *));
+}
+
+void ggml_cpu_moe_group_pin(struct ggml_cpu_moe_group * g, const struct ggml_cpu_moe_stream * stream,
+                            struct ggml_threadpool * tp, int64_t n_as, int32_t begin) {
+    if (begin >= g->n) {
+        return;
+    }
+    const int k = stream->acquire(stream->context, ggml_cpu_moe_group_ids(g) + begin, g->n - begin,
+                                  ggml_cpu_moe_group_data(g, n_as) + begin);
+    g->failed = k <= 0;
+    g->end    = begin + (k > 0 ? k : 0);
+    if (g->failed) {
+        ggml_cpu_moe_stream_fail(tp);
+    }
+}
+
+void ggml_cpu_moe_group_init(struct ggml_cpu_moe_group * g, const struct ggml_cpu_moe_stream * stream,
+                             struct ggml_threadpool * tp, const int64_t * counts, int64_t n_as) {
+    int32_t * ids = ggml_cpu_moe_group_ids(g);
+    g->n      = 0;
+    g->end    = 0;
+    g->failed = 0;
+    for (int64_t e = 0; e < n_as; e++) {
+        if (counts[e] > 0) {
+            ids[g->n++] = (int32_t) e;
+        }
+    }
+    ggml_cpu_moe_group_pin(g, stream, tp, n_as, 0);
+}
+
+// all workers: after computing the group [begin, g->end), release it and pin the next one
+// returns the next begin, or -1 when all experts are done or on failure
+int32_t ggml_cpu_moe_group_next(struct ggml_cpu_moe_group * g, const struct ggml_cpu_moe_stream * stream,
+                                const struct ggml_compute_params * params, int64_t n_as, int32_t begin) {
+    const int32_t end = g->end;
+    const int32_t n   = g->n;
+    ggml_barrier(params->threadpool);
+    if (params->ith == 0) {
+        if (end > begin) {
+            stream->release(stream->context, ggml_cpu_moe_group_ids(g) + begin, end - begin);
+        }
+        ggml_cpu_moe_group_pin(g, stream, params->threadpool, n_as, end);
+    }
+    if (end >= n) {
+        return -1;
+    }
+    ggml_barrier(params->threadpool);
+    return g->failed ? -1 : end;
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1577,6 +1645,7 @@ static void ggml_compute_forward_mul_mat_id(
 
     const int ith = params->ith;
     const int nth = params->nth;
+    const struct ggml_cpu_moe_stream * stream = ggml_cpu_get_moe_stream(src0);
 
     const enum ggml_type type = src0->type;
 
@@ -1617,6 +1686,9 @@ static void ggml_compute_forward_mul_mat_id(
     // Tiled matmul (see tiled.h); per-thread work buffers, 0 bytes when disabled. The
     // reservation is unconditional, the per expert eligibility is decided at dispatch time
     char * tiled_scratch = incr_ptr_aligned(&wdata_cur, ggml_tiled_wdata_size(nth, dst), 64);
+
+    struct ggml_cpu_moe_group * group = // streamed experts
+        incr_ptr_aligned(&wdata_cur, ggml_cpu_moe_group_size(n_as), sizeof(int64_t));
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
@@ -1677,6 +1749,10 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+
+        if (stream) {
+            ggml_cpu_moe_group_init(group, stream, params->threadpool, matrix_row_counts, n_as);
+        }
     }
 
     // reset current_chunk
@@ -1687,72 +1763,87 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
-    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-        const int64_t cne1 = matrix_row_counts[cur_a];
+    const int32_t *    group_ids  = stream ? ggml_cpu_moe_group_ids(group) : NULL;
+    const void * const * group_data = stream ? ggml_cpu_moe_group_data(group, n_as) : NULL;
 
-        if (cne1 == 0) {
-            continue;
+    // without streaming this is a single pass over all experts. Streamed experts come in groups
+    // pinned by thread 0; the workers do not synchronize between the experts of a group
+    for (int32_t begin = 0; begin >= 0; begin = stream ? ggml_cpu_moe_group_next(group, stream, params, n_as, begin) : -1) {
+        if (stream && group->failed) {
+            return;
         }
+        const int32_t end = stream ? group->end : n_as;
+        for (int32_t i = begin; i < end; ++i) {
+            const int cur_a = stream ? group_ids[i] : i;
+            const int64_t cne1 = matrix_row_counts[cur_a];
 
-        // tiled takes over if profitable for this expert (see tiled.h)
-        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
-            continue;
-        }
-
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
-        const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
-        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
-
-        const int64_t nr0 = ne01;
-        const int64_t nr1 = cne1;
-
-        int chunk_size = 16;
-        if (nr0 == 1 || nr1 == 1) {
-            chunk_size = 64;
-        }
-
-        // disable for NUMA
-        const bool disable_chunking = ggml_is_numa();
-
-        int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
-        int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
-
-        if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
-            nchunk0 = nr0 > nr1 ? nth : 1;
-            nchunk1 = nr0 > nr1 ? 1 : nth;
-        }
-
-        const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
-        const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
-
-        int current_chunk = ith;
-
-        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
-
-        while (current_chunk < nchunk0 * nchunk1) {
-            const int64_t ith0 = current_chunk % nchunk0;
-            const int64_t ith1 = current_chunk / nchunk0;
-
-            const int64_t ir0_start = dr0 * ith0;
-            const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
-
-            const int64_t ir1_start = dr1 * ith1;
-            const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
-
-            ggml_compute_forward_mul_mat_id_one_chunk(
-                dst, src0, src1, ids, cur_a,
-                ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata
-            );
-
-            if (nth >= nchunk0 * nchunk1) {
-                break;
+            if (cne1 == 0) {
+                continue;
             }
 
-            current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+            const char * src0_cur = stream ? (const char *) group_data[i] : (const char *) src0->data + cur_a * nb02;
+
+            // tiled takes over if profitable for this expert (see tiled.h)
+            if (ggml_compute_forward_mul_mat_id_tiled(params, dst, src0_cur, cne1,
+                    (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
+                continue;
+            }
+
+            const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+            const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+            const int64_t nr0 = ne01;
+            const int64_t nr1 = cne1;
+
+            int chunk_size = 16;
+            if (nr0 == 1 || nr1 == 1) {
+                chunk_size = 64;
+            }
+
+            // disable for NUMA
+            const bool disable_chunking = ggml_is_numa();
+
+            int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+            int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+
+            if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
+                nchunk0 = nr0 > nr1 ? nth : 1;
+                nchunk1 = nr0 > nr1 ? 1 : nth;
+            }
+
+            const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+            const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+
+            int current_chunk = ith;
+
+            atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+
+            while (current_chunk < nchunk0 * nchunk1) {
+                const int64_t ith0 = current_chunk % nchunk0;
+                const int64_t ith1 = current_chunk / nchunk0;
+
+                const int64_t ir0_start = dr0 * ith0;
+                const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+
+                const int64_t ir1_start = dr1 * ith1;
+                const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
+
+                ggml_compute_forward_mul_mat_id_one_chunk(
+                    dst, src0, src1, ids, cur_a,
+                    ir0_start, ir0_end, ir1_start, ir1_end,
+                    src0_cur, matrix_rows, row_size, src1_cont, wdata
+                );
+
+                if (nth >= nchunk0 * nchunk1) {
+                    break;
+                }
+
+                current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+            }
         }
     }
 }
+
 
 /////////////////////////////////
 
@@ -2791,6 +2882,60 @@ struct ggml_cpu_perf_cores {
 
 static struct ggml_cpu_perf_cores ggml_perf_cores = { GGML_CPU_AUTO_AFFINITY_OFF, 0, { 0 } };
 
+// Last CPU pool, not a promise about future pools or OS permissions.
+static atomic_flag ggml_affinity_lock = ATOMIC_FLAG_INIT;
+static struct {
+    const struct ggml_threadpool * pool;
+    int threads, completed, applied, failed;
+    bool automatic, explicit_mask;
+} ggml_affinity_report;
+
+static void ggml_affinity_lock_enter(void) {
+    while (atomic_flag_test_and_set_explicit(&ggml_affinity_lock, memory_order_acquire)) {}
+}
+
+static void ggml_affinity_lock_leave(void) {
+    atomic_flag_clear_explicit(&ggml_affinity_lock, memory_order_release);
+}
+
+void ggml_cpu_get_affinity_status(char * text, size_t size) {
+    ggml_affinity_lock_enter();
+    const char * mode = ggml_perf_cores.mode == GGML_CPU_AUTO_AFFINITY_STRICT ? "Strict placement" : "Performance cores";
+    if (ggml_affinity_report.explicit_mask) {
+        snprintf(text, size, "Explicit CPU mask: %d/%d workers applied, %d failed",
+                ggml_affinity_report.applied, ggml_affinity_report.threads, ggml_affinity_report.failed);
+    } else if (ggml_perf_cores.mode == GGML_CPU_AUTO_AFFINITY_OFF) {
+        snprintf(text, size, "System scheduling");
+    } else if (!ggml_affinity_report.pool) {
+        snprintf(text, size, "%s requested; no CPU pool observed yet", mode);
+    } else if (!ggml_affinity_report.automatic) {
+        if (ggml_perf_cores.n_perf == 0) {
+            snprintf(text, size, "System scheduling: no usable heterogeneous CPU topology");
+        } else if (ggml_affinity_report.threads > ggml_perf_cores.n_perf) {
+            snprintf(text, size, "System scheduling: %d threads exceed %d performance cores",
+                    ggml_affinity_report.threads, ggml_perf_cores.n_perf);
+        } else {
+            snprintf(text, size, "Explicit CPU mask (automatic placement not used)");
+        }
+    } else if (ggml_affinity_report.failed) {
+        snprintf(text, size, "%s requested; OS affinity failed for %d/%d workers",
+                mode, ggml_affinity_report.failed, ggml_affinity_report.threads);
+    } else if (ggml_affinity_report.completed < ggml_affinity_report.threads) {
+        snprintf(text, size, "%s requested; worker affinity pending", mode);
+    } else {
+        snprintf(text, size, "%s: applied to %d workers (%d performance cores detected)",
+                mode, ggml_affinity_report.applied, ggml_perf_cores.n_perf);
+    }
+    ggml_affinity_lock_leave();
+}
+
+static int ggml_cpu_affinity_mode_from_env(void) {
+    const char * env = getenv("GGML_CPU_AFFINITY");
+    if (env && (strcmp(env, "off") == 0 || strcmp(env, "0") == 0)) return GGML_CPU_AUTO_AFFINITY_OFF;
+    if (env && strcmp(env, "strict") == 0) return GGML_CPU_AUTO_AFFINITY_STRICT;
+    return GGML_CPU_AUTO_AFFINITY_PERF;
+}
+
 #if defined(__linux__) && !defined(GGML_USE_OPENMP)
 static long ggml_read_sysfs_long(const char * path) {
     FILE * f = fopen(path, "r");
@@ -2808,15 +2953,7 @@ static long ggml_read_sysfs_long(const char * path) {
 static void ggml_cpu_detect_perf_cores(struct ggml_cpu_perf_cores * pc) {
     memset(pc, 0, sizeof(*pc));
 
-    const char * env = getenv("GGML_CPU_AFFINITY");
-    pc->mode = GGML_CPU_AUTO_AFFINITY_PERF;
-    if (env) {
-        if (strcmp(env, "off") == 0 || strcmp(env, "0") == 0) {
-            pc->mode = GGML_CPU_AUTO_AFFINITY_OFF;
-        } else if (strcmp(env, "strict") == 0) {
-            pc->mode = GGML_CPU_AUTO_AFFINITY_STRICT;
-        }
-    }
+    pc->mode = ggml_cpu_affinity_mode_from_env();
     if (pc->mode == GGML_CPU_AUTO_AFFINITY_OFF) {
         return;
     }
@@ -2890,6 +3027,7 @@ static void ggml_cpu_detect_perf_cores(struct ggml_cpu_perf_cores * pc) {
 #else
 static void ggml_cpu_detect_perf_cores(struct ggml_cpu_perf_cores * pc) {
     memset(pc, 0, sizeof(*pc));
+    pc->mode = ggml_cpu_affinity_mode_from_env();
 }
 #endif
 
@@ -2915,15 +3053,19 @@ static bool ggml_thread_auto_affinity(struct ggml_compute_state * workers, int n
     return true;
 }
 
-static void ggml_threadpool_apply_affinity(const struct ggml_threadpool * tp, const bool * mask) {
-    if (!ggml_thread_cpumask_is_valid(mask)) {
-        return;
+static void ggml_threadpool_apply_affinity(struct ggml_compute_state * state) {
+    const struct ggml_threadpool * tp = state->threadpool;
+    const bool * mask = state->cpumask;
+    const int status = !ggml_thread_cpumask_is_valid(mask) ? 2 :
+            (tp->auto_affinity ? ggml_thread_apply_affinity_quiet(mask) : ggml_thread_apply_affinity(mask)) ? 1 : -1;
+    ggml_affinity_lock_enter();
+    if (ggml_affinity_report.pool == tp) {
+        ggml_affinity_report.completed += (state->affinity_status == 0);
+        ggml_affinity_report.applied += (status == 1) - (state->affinity_status == 1);
+        ggml_affinity_report.failed += (status == -1) - (state->affinity_status == -1);
     }
-    if (tp->auto_affinity) {
-        ggml_thread_apply_affinity_quiet(mask);
-    } else {
-        ggml_thread_apply_affinity(mask);
-    }
+    state->affinity_status = status;
+    ggml_affinity_lock_leave();
 }
 
 static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask, bool strict, int32_t* iter) {
@@ -3118,6 +3260,8 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                        // streamed experts
+                        cur += ggml_cpu_moe_group_size(n_as) + sizeof(int64_t);
                         // Workspace for tiled (see tiled.h)
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);
@@ -3286,8 +3430,13 @@ static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_in
 // (gate, up and down) so the I/O is issued in bulk and overlaps with the compute.
 // Opt-in: for resident weights the hints are pure syscall overhead.
 //
-static bool ggml_cpu_moe_prefetch = false;
+static atomic_bool ggml_cpu_moe_prefetch = false;
 static bool ggml_cpu_fuse_ffn      = true; // GGML_CPU_FUSE_FFN=0 disables the up/gate/swiglu fusion
+
+void ggml_cpu_set_moe_prefetch(bool enabled) {
+    ggml_cpu_init();
+    atomic_store_explicit(&ggml_cpu_moe_prefetch, enabled, memory_order_relaxed);
+}
 
 #if (defined(__linux__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
 #include <sys/mman.h>
@@ -3332,8 +3481,13 @@ static void ggml_cpu_prefetch_moe_experts(const struct ggml_cgraph * cgraph, int
             continue;
         }
         const struct ggml_tensor * w = t->src[0];
+        const struct ggml_cpu_moe_stream * stream = ggml_cpu_get_moe_stream(w);
         for (int64_t e = 0; e < w->ne[2] && e < n_as; e++) {
             if (!(used[e/64] & (1ull << (e%64)))) {
+                continue;
+            }
+            if (stream) {
+                if (stream->prefetch) stream->prefetch(stream->context, e);
                 continue;
             }
             const uintptr_t beg = (uintptr_t) w->data + (uintptr_t) (e*w->nb[2]);
@@ -3810,7 +3964,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
-        if (ggml_cpu_moe_prefetch && node->op == GGML_OP_MUL_MAT_ID && state->ith == 0) {
+        if (atomic_load_explicit(&ggml_cpu_moe_prefetch, memory_order_relaxed) &&
+                node->op == GGML_OP_MUL_MAT_ID && state->ith == 0) {
             ggml_cpu_prefetch_moe_experts(cgraph, node_n);
         }
 
@@ -3823,7 +3978,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_compute_forward(&params, node);
         }
 
-        if (state->ith == 0 && cplan->abort_callback &&
+        if (state->ith == 0 && atomic_load_explicit(&tp->failed, memory_order_relaxed)) {
+            atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
+            tp->ec = GGML_STATUS_FAILED;
+        } else if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
             atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
             tp->ec    = GGML_STATUS_ABORTED;
@@ -3920,7 +4078,7 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     struct ggml_threadpool * threadpool = state->threadpool;
 
     ggml_thread_apply_priority(threadpool->prio);
-    ggml_threadpool_apply_affinity(state->threadpool, state->cpumask);
+    ggml_threadpool_apply_affinity(state);
 
     while (true) {
         // Check if we need to sleep
@@ -3970,7 +4128,7 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
     if (threadpool->pause) {
        // Update main thread prio and affinity to match the threadpool settings
        ggml_thread_apply_priority(threadpool->prio);
-       ggml_threadpool_apply_affinity(threadpool, threadpool->workers[0].cpumask);
+       ggml_threadpool_apply_affinity(&threadpool->workers[0]);
 
        // resume does cond broadcast
        ggml_threadpool_resume_locked(threadpool);
@@ -4000,6 +4158,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->stop             = false;
         threadpool->pause            = tpp->paused;
         threadpool->abort            = -1;
+        threadpool->failed           = false;
         threadpool->workers          = NULL;
         threadpool->n_threads        = tpp->n_threads;
         threadpool->poll             = tpp->poll;
@@ -4024,6 +4183,13 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     if (!ggml_thread_cpumask_is_valid(tpp->cpumask)) {
         threadpool->auto_affinity = ggml_thread_auto_affinity(workers, tpp->n_threads);
     }
+    ggml_affinity_lock_enter();
+    ggml_affinity_report.pool = threadpool;
+    ggml_affinity_report.threads = tpp->n_threads;
+    ggml_affinity_report.completed = ggml_affinity_report.applied = ggml_affinity_report.failed = 0;
+    ggml_affinity_report.automatic = threadpool->auto_affinity;
+    ggml_affinity_report.explicit_mask = ggml_thread_cpumask_is_valid(tpp->cpumask);
+    ggml_affinity_lock_leave();
 
 #ifdef GGML_USE_OPENMP
     int32_t cpumask_iter = 0;
@@ -4059,7 +4225,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     if (!threadpool->pause) {
         // Update main thread prio and affinity at the start, otherwise we'll do it in resume
         ggml_thread_apply_priority(threadpool->prio);
-        ggml_threadpool_apply_affinity(threadpool, threadpool->workers[0].cpumask);
+        ggml_threadpool_apply_affinity(&threadpool->workers[0]);
     }
 #endif // GGML_USE_OPENMP
 
@@ -4095,6 +4261,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->cplan            = cplan;
         threadpool->current_chunk    = 0;
         threadpool->abort            = -1;
+        threadpool->failed           = false;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
@@ -4113,7 +4280,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             int ith = omp_get_thread_num();
 
             ggml_thread_apply_priority(threadpool->prio);
-            ggml_threadpool_apply_affinity(threadpool, threadpool->workers[ith].cpumask);
+            ggml_threadpool_apply_affinity(&threadpool->workers[ith]);
             ggml_graph_compute_thread(&threadpool->workers[ith]);
         }
     } else {
@@ -4641,7 +4808,7 @@ void ggml_cpu_init(void) {
 
         {
             const char * env = getenv("GGML_CPU_MOE_PREFETCH");
-            ggml_cpu_moe_prefetch = (env != NULL && atoi(env) == 1);
+            atomic_store_explicit(&ggml_cpu_moe_prefetch, env != NULL && atoi(env) == 1, memory_order_relaxed);
         }
 
         is_first_call = false;

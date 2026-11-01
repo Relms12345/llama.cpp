@@ -4702,7 +4702,7 @@ template <> void gemm<block_q2_K, 1, 16, GGML_TYPE_Q8_K>(int n, float * s, size_
 
 class tensor_traits_base : public ggml::cpu::tensor_traits {
   public:
-    virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
+    virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size, bool log = true) = 0;
 };
 
 
@@ -4886,6 +4886,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     const size_t sizeof_mmid_row_mapping = sizeof(int64_t);
 
                     size += sizeof_mmid_row_mapping*ne02*(ne12 + 1);
+                    size += ggml_cpu_moe_group_size(ne02) + sizeof(int64_t); // streamed experts
 
                     return true;
                 }
@@ -5098,6 +5099,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const ggml_tensor * src1 = op->src[1];
         const ggml_tensor * ids  = op->src[2];
         ggml_tensor *       dst  = op;
+        const ggml_cpu_moe_stream * stream = ggml_cpu_get_moe_stream(src0);
 
         GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -5137,7 +5139,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         GGML_ASSERT(params->wsize >=
                 (GGML_PAD(nbw3, sizeof(int64_t)) +
-                 n_as*(ne12 + 1)*sizeof(mmid_row_mapping))
+                 n_as*(ne12 + 1)*sizeof(mmid_row_mapping) +
+                 ggml_cpu_moe_group_size(n_as) + sizeof(int64_t))
                 );
 
         auto * wdata          = (char *)params->wdata;
@@ -5146,6 +5149,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // total of [n_as][ne12 + 1] elements of type mmid_row_mapping (2*int32_t = int64_t)
         auto * matrix_row_counts = (int64_t *) (wdata_src1_end);                                        // [n_as]
         struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (matrix_row_counts + n_as); // [n_as][ne12]
+        auto * group = (ggml_cpu_moe_group *) (matrix_rows + n_as*ne12);                               // streamed experts
 
         // src1: float32 => param type
         for (int64_t i12 = 0; i12 < ne12; ++i12) {
@@ -5179,61 +5183,78 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     matrix_row_counts[i02] += 1;
                 }
             }
+
+            if (stream) {
+                ggml_cpu_moe_group_init(group, stream, params->threadpool, matrix_row_counts, n_as);
+            }
         }
 
         ggml_barrier(params->threadpool);
 
-        // compute each matrix multiplication in sequence
-        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-            const int64_t cne1 = matrix_row_counts[cur_a];
+        // this thread's rows of every expert
+        int64_t src0_cur_start = (ith * ne01) / nth;
+        int64_t src0_cur_end   = ((ith + 1) * ne01) / nth;
 
-            if (cne1 == 0) {
-                continue;
-            }
+        // Align boundaries to NB_COLS - round up to ensure all data is included
+        src0_cur_start = (src0_cur_start % NB_COLS) ? src0_cur_start + NB_COLS - (src0_cur_start % NB_COLS) : src0_cur_start;
+        src0_cur_end   = (src0_cur_end   % NB_COLS) ? src0_cur_end   + NB_COLS - (src0_cur_end   % NB_COLS) : src0_cur_end;
+        if (src0_cur_end > ne01) {
+            src0_cur_end = ne01;
+        }
 
-            const auto * src0_cur = (const char *) src0->data + cur_a*nb02;
+        if (src0_cur_start >= src0_cur_end && !stream) {
+            return;
+        }
 
-            //const int64_t nr0 = ne01; // src0 rows
-            const int64_t nr1 = cne1; // src1 rows
+        const int32_t *      group_ids  = stream ? ggml_cpu_moe_group_ids(group) : nullptr;
+        const void * const * group_data = stream ? ggml_cpu_moe_group_data(group, n_as) : nullptr;
 
-            int64_t src0_cur_start = (ith * ne01) / nth;
-            int64_t src0_cur_end   = ((ith + 1) * ne01) / nth;
-
-            // Align boundaries to NB_COLS - round up to ensure all data is included
-            src0_cur_start = (src0_cur_start % NB_COLS) ? src0_cur_start + NB_COLS - (src0_cur_start % NB_COLS) : src0_cur_start;
-            src0_cur_end   = (src0_cur_end   % NB_COLS) ? src0_cur_end   + NB_COLS - (src0_cur_end   % NB_COLS) : src0_cur_end;
-            if (src0_cur_end > ne01) {
-                src0_cur_end = ne01;
-            }
-
-            if (src0_cur_start >= src0_cur_end) {
+        // compute each matrix multiplication in sequence, streamed experts in pinned groups
+        for (int32_t begin = 0; begin >= 0; begin = stream ? ggml_cpu_moe_group_next(group, stream, params, n_as, begin) : -1) {
+            if (stream && group->failed) {
                 return;
             }
+            const int32_t end = stream ? group->end : n_as;
+            for (int32_t i = begin; i < end && src0_cur_start < src0_cur_end; ++i) {
+                const int cur_a = stream ? group_ids[i] : i;
+                const int64_t cne1 = matrix_row_counts[cur_a];
 
-            for (int ir1 = 0; ir1 < nr1; ir1++) {
-                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+                if (cne1 == 0) {
+                    continue;
+                }
 
-                const int id = row_mapping.i1;  // selected expert index
+                const auto * src0_cur = stream ? (const char *) group_data[i] : (const char *) src0->data + cur_a*nb02;
 
-                const int64_t i11 = id % ne11;
-                const int64_t i12 = row_mapping.i2;  // row index in src1
+                //const int64_t nr0 = ne01; // src0 rows
+                const int64_t nr1 = cne1; // src1 rows
 
-                const int64_t i1 = id;               // selected expert index
-                const int64_t i2 = i12;              // row
+                for (int ir1 = 0; ir1 < nr1; ir1++) {
+                    struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
 
-                const auto * src1_col = (const char *) wdata + (i11 * nbw1 + i12 * nbw2);
+                    const int id = row_mapping.i1;  // selected expert index
 
-                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
-                    ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
-                    src0_cur + src0_cur_start * nb01, src1_col, 1, src0_cur_end - src0_cur_start);
+                    const int64_t i11 = id % ne11;
+                    const int64_t i12 = row_mapping.i2;  // row index in src1
+
+                    const int64_t i1 = id;               // selected expert index
+                    const int64_t i2 = i12;              // row
+
+                    const auto * src1_col = (const char *) wdata + (i11 * nbw1 + i12 * nbw2);
+
+                    gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                        ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
+                        src0_cur + src0_cur_start * nb01, src1_col, 1, src0_cur_end - src0_cur_start);
+                }
             }
         }
 #undef MMID_MATRIX_ROW
     }
 
-    int repack(struct ggml_tensor * t, const void * data, size_t data_size) override {
-        GGML_LOG_DEBUG("%s: repack tensor %s with %s_%dx%d\n", __func__, t->name, ggml_type_name(t->type),
-                       (int) NB_COLS, (int) INTER_SIZE);
+    int repack(struct ggml_tensor * t, const void * data, size_t data_size, bool log = true) override {
+        if (log) {
+            GGML_LOG_DEBUG("%s: repack tensor %s with %s_%dx%d\n", __func__, t->name, ggml_type_name(t->type),
+                           (int) NB_COLS, (int) INTER_SIZE);
+        }
         return ggml::cpu::repack::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(t, data, data_size);
     }
 };
@@ -5549,6 +5570,51 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     return nullptr;
 }
 
+size_t ggml_cpu_moe_repack_work_size(const ggml_tensor * tensor) {
+#ifndef GGML_USE_CPU_REPACK
+    GGML_UNUSED(tensor);
+    return 0;
+#else
+    // only the offline repack formats: the on-the-fly IQ conversions keep a cache of their own
+    switch (tensor->type) {
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K: case GGML_TYPE_Q8_0: case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS: case GGML_TYPE_MXFP4: case GGML_TYPE_Q1_0:
+            break;
+        default:
+            return 0;
+    }
+    if (!ggml_repack_get_optimal_repack_type(tensor)) {
+        return 0;
+    }
+    // one group of interleaved rows, the largest NB_COLS is 16
+    const int64_t rows = tensor->ne[1] % 16 == 0 ? 16 : tensor->ne[1] % 8 == 0 ? 8 : 4;
+    return tensor->ne[1] % rows == 0 ? rows * tensor->nb[1] : 0;
+#endif
+}
+
+bool ggml_cpu_moe_repack(const ggml_tensor * tensor, void * data, void * scratch) {
+    const size_t group_size = ggml_cpu_moe_repack_work_size(tensor);
+    if (!group_size) {
+        return false;
+    }
+    auto * traits = (ggml::cpu::repack::tensor_traits_base *)
+            const_cast<ggml::cpu::tensor_traits *>(ggml_repack_get_optimal_repack_type(tensor));
+    ggml_tensor group = *tensor;
+    group.ne[1] = group_size / tensor->nb[1];
+    group.ne[2] = group.ne[3] = 1;
+    group.nb[2] = group.nb[3] = group_size;
+    // row groups are independent: repack one at a time in place, through a copy of that group
+    for (size_t offset = 0; offset < tensor->nb[2]; offset += group_size) {
+        group.data = (char *) data + offset;
+        memcpy(scratch, group.data, group_size);
+        if (traits->repack(&group, scratch, group_size, false) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static enum ggml_status ggml_backend_cpu_repack_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
     tensor->extra = (void *) const_cast<ggml::cpu::tensor_traits *>(ggml_repack_get_optimal_repack_type(tensor));
 
@@ -5634,6 +5700,13 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
     }
 
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
+        if (op->op == GGML_OP_MUL_MAT_ID) {
+            const auto * stream = ggml_cpu_get_moe_stream(op->src[0]);
+            if (stream && stream->repacked) {
+                GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32); // the canonical kernels cannot read packed experts
+                return const_cast<ggml::cpu::tensor_traits *>(ggml_repack_get_optimal_repack_type(op->src[0]));
+            }
+        }
         if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) {
             if (op->src[0]->buffer && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
                 return (ggml::cpu::tensor_traits *) op->src[0]->extra;

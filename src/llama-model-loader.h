@@ -27,6 +27,8 @@ enum llama_fver {
 
 const char * llama_file_version_name(llama_fver version);
 
+class llama_moe_stream;
+
 struct llama_model_loader {
     // Holds information on a model weight
     struct llama_tensor_weight {
@@ -81,6 +83,7 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    llama_moe_stream * moe_stream = nullptr; // model-owned CPU expert cache, if enabled
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
@@ -90,7 +93,7 @@ struct llama_model_loader {
 
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask
-        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
+        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool force = false);
 
         bool any() const {
             return !ranges.empty();

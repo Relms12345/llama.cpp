@@ -21,7 +21,7 @@ bool ggml_compute_forward_mul_mat_tiled(const struct ggml_compute_params * param
 // per-thread tiled_ws region reserved in wdata, n_tasks of ggml_tiled_ws_size() bytes
 bool ggml_compute_forward_mul_mat_id_tiled(const struct ggml_compute_params * params,
                                            struct ggml_tensor *               dst,
-                                           int64_t                            cur_a,
+                                           const void *                       expert_data,
                                            int64_t                            cne1,
                                            const int32_t *                    expert_rows,
                                            char *                             scratch);

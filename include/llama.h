@@ -355,7 +355,31 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        uint64_t moe_cache_bytes; // bounded CPU routed-expert cache; 0 disables disk streaming. If all routed experts fit, they are loaded normally
     };
+
+    struct llama_moe_cache_stats {
+        uint64_t capacity_bytes; // expert payload budget, not total process RAM
+        uint64_t used_bytes;     // retained allocated expert payload
+        uint64_t hits;
+        uint64_t misses;
+        uint64_t bytes_read;
+        uint64_t read_time_us;
+        uint64_t repacked_bytes; // subset of used_bytes using CPU_REPACK, including bounded scratch
+    };
+
+    // false when moe_cache_bytes was 0. With all experts resident, used_bytes is their size and nothing is read later
+    LLAMA_API bool llama_model_get_moe_cache_stats(
+            const struct llama_model * model, struct llama_moe_cache_stats * out);
+
+    // Load preferred expert slices up to the cache budget. Call before creating contexts.
+    // profile_path stores usage metadata only; NULL disables persistence. Returns false on
+    // cancellation or expert I/O failure. Whole slices may leave unused budget bytes.
+    LLAMA_API bool llama_model_moe_cache_prefill(
+            struct llama_model * model, const char * profile_path,
+            llama_progress_callback progress_callback, void * progress_callback_user_data);
+    // Persist usage after a turn; also saved on model destruction. No expert payload copies.
+    LLAMA_API bool llama_model_moe_cache_save(struct llama_model * model);
 
     struct llama_sampler_seq_config {
         llama_seq_id           seq_id;
