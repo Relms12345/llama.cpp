@@ -7,6 +7,7 @@
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "quants.h"
+#include "turbo.h"
 #include "ggml-threading.h"
 #include "unary-ops.h"
 #include "binary-ops.h"
@@ -302,6 +303,36 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F8_E4M3] = {
         .from_float               = quantize_row_f8_e4m3,
         .vec_dot                  = ggml_vec_dot_f8_e4m3_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO2_0] = {
+        .from_float               = quantize_row_turbo2_0,
+        .vec_dot                  = ggml_vec_dot_turbo2_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO3_0] = {
+        .from_float               = quantize_row_turbo3_0,
+        .vec_dot                  = ggml_vec_dot_turbo3_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO4_0] = {
+        .from_float               = quantize_row_turbo4_0,
+        .vec_dot                  = ggml_vec_dot_turbo4_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO5_0] = {
+        .from_float               = quantize_row_turbo5_0,
+        .vec_dot                  = ggml_vec_dot_turbo5_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO6_0] = {
+        .from_float               = quantize_row_turbo6_0,
+        .vec_dot                  = ggml_vec_dot_turbo6_0_f32,
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
@@ -2199,6 +2230,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_TURBO_WHT:
+            {
+                ggml_compute_forward_turbo_wht(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2399,6 +2434,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_TURBO_WHT:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -4752,6 +4788,8 @@ void ggml_cpu_init(void) {
                 ggml_table_gelu_f16[i] = GGML_CPU_FP32_TO_FP16(ggml_gelu_f32(f));
                 ggml_table_gelu_quick_f16[i] = GGML_CPU_FP32_TO_FP16(ggml_gelu_quick_f32(f));
             }
+
+            ggml_cpu_turbo_init();
 
             // initialize E8M0 half table (256 entries)
             for (int i = 0; i < (1 << 8); ++i) {

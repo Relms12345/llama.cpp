@@ -433,7 +433,14 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_F8_E4M3 = 43,
-        GGML_TYPE_COUNT   = 44,
+        // TurboQuant KV cache types: runtime only, never stored in model files.
+        // 45, 46 and 48-50 are left unused: they hold TurboQuant weight types in other forks.
+        GGML_TYPE_TURBO3_0 = 44,
+        GGML_TYPE_TURBO4_0 = 47,
+        GGML_TYPE_TURBO5_0 = 51,
+        GGML_TYPE_TURBO6_0 = 52,
+        GGML_TYPE_TURBO2_0 = 53,
+        GGML_TYPE_COUNT   = 54,
     };
 
     // [TAG_GGML_PREC]
@@ -605,6 +612,8 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        GGML_OP_TURBO_WHT,
 
         GGML_OP_COUNT,
     };
@@ -780,6 +789,7 @@ extern "C" {
     GGML_API size_t  ggml_element_size(const struct ggml_tensor * tensor);
 
     GGML_API bool    ggml_is_quantized(enum ggml_type type);
+    GGML_API bool    ggml_is_turbo    (enum ggml_type type); // TurboQuant KV cache type (TURBO2_0 .. TURBO6_0)
 
     // TODO: temporary until model loading of ggml examples is refactored
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);
@@ -2672,6 +2682,14 @@ extern "C" {
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
     // when n_tokens > K only slot 0 is guaranteed; backends may leave slots 1..K-1 unwritten.
+    // TurboQuant rotation: a fixed orthonormal 128x128 transform (random signs, Walsh-Hadamard, random signs)
+    // applied to each group of 128 values along ne[0]. a must be F32 with ne[0] % 128 == 0 and contiguous rows.
+    // direction: 0 = forward (the rotation applied when a turbo KV cache is written), 1 = inverse
+    GGML_API struct ggml_tensor * ggml_turbo_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   direction);
+
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,

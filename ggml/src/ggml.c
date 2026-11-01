@@ -781,6 +781,46 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_f8_e4m3,
         .from_float_ref           = (ggml_from_float_t) quantize_row_f8_e4m3_ref,
     },
+    [GGML_TYPE_TURBO2_0] = {
+        .type_name                = "turbo2",
+        .blck_size                = QK_TURBO,
+        .type_size                = sizeof(block_turbo2_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo2_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo2_0_ref,
+    },
+    [GGML_TYPE_TURBO3_0] = {
+        .type_name                = "turbo3",
+        .blck_size                = QK_TURBO,
+        .type_size                = sizeof(block_turbo3_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo3_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo3_0_ref,
+    },
+    [GGML_TYPE_TURBO4_0] = {
+        .type_name                = "turbo4",
+        .blck_size                = QK_TURBO,
+        .type_size                = sizeof(block_turbo4_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo4_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4_0_ref,
+    },
+    [GGML_TYPE_TURBO5_0] = {
+        .type_name                = "turbo5",
+        .blck_size                = QK_TURBO,
+        .type_size                = sizeof(block_turbo5_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo5_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo5_0_ref,
+    },
+    [GGML_TYPE_TURBO6_0] = {
+        .type_name                = "turbo6",
+        .blck_size                = QK_TURBO,
+        .type_size                = sizeof(block_turbo6_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo6_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo6_0_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -1116,9 +1156,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "TURBO_WHT",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1232,9 +1274,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "turbo_wht(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1377,6 +1421,19 @@ bool ggml_is_quantized(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);
     return type_traits[type].is_quantized;
+}
+
+bool ggml_is_turbo(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO5_0:
+        case GGML_TYPE_TURBO6_0:
+            return true;
+        default:
+            return false;
+    }
 }
 
 const char * ggml_op_name(enum ggml_op op) {
@@ -6425,6 +6482,27 @@ struct ggml_tensor * ggml_solve_tri(
 
 // ggml_gated_delta_net
 
+// ggml_turbo_wht
+
+struct ggml_tensor * ggml_turbo_wht(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   direction) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] % 128 == 0);
+    GGML_ASSERT(a->nb[0] == sizeof(float));
+    GGML_ASSERT(direction == 0 || direction == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, a->ne);
+
+    ggml_set_op_params_i32(result, 0, direction);
+
+    result->op     = GGML_OP_TURBO_WHT;
+    result->src[0] = a;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -8201,6 +8279,11 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q6_K:    result = quantize_q6_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ1_0:   result = quantize_tq1_0  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ2_0:   result = quantize_tq2_0  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO2_0: result = quantize_turbo2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO3_0: result = quantize_turbo3_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO4_0: result = quantize_turbo4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO5_0: result = quantize_turbo5_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO6_0: result = quantize_turbo6_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XXS: result = quantize_iq2_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XS:  result = quantize_iq2_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ3_XXS: result = quantize_iq3_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
