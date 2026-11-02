@@ -1680,7 +1680,16 @@ inline static void ggml_vec_sum_bf16_ggf(const int n, float * s, const ggml_bf16
 inline static void ggml_vec_max_f32(const int n, float * s, const float * x) {
 #ifndef GGML_USE_ACCELERATE
     float max = -INFINITY;
-    for (int i = 0; i < n; ++i) {
+    int i = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    // maxnm skips NaN like the scalar loop below
+    float32x4_t vmax = vdupq_n_f32(-INFINITY);
+    for (; i + 4 <= n; i += 4) {
+        vmax = vmaxnmq_f32(vmax, vld1q_f32(x + i));
+    }
+    max = vmaxnmvq_f32(vmax);
+#endif
+    for (; i < n; ++i) {
         max = MAX(max, x[i]);
     }
     *s = max;
@@ -1695,6 +1704,39 @@ inline static void ggml_vec_norm_inv_f32(const int n, float * s, const float * x
 }
 
 inline static void ggml_vec_argmax_f32(const int n, int * s, const float * x) {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    // max first, then the last index holding it (same result as the scalar loop); NaN input takes the scalar loop
+    if (n >= 4) {
+        float32x4_t vmax = vdupq_n_f32(-INFINITY);
+        uint32x4_t  vord = vdupq_n_u32(~0u);
+        int i = 0;
+        for (; i + 4 <= n; i += 4) {
+            const float32x4_t v = vld1q_f32(x + i);
+            vmax = vmaxq_f32(vmax, v);
+            vord = vandq_u32(vord, vceqq_f32(v, v));
+        }
+        float max = vmaxvq_f32(vmax);
+        bool has_nan = vminvq_u32(vord) == 0;
+        for (; i < n; ++i) {
+            has_nan |= x[i] != x[i];
+            max = MAX(max, x[i]);
+        }
+        if (!has_nan) {
+            int j = n - 1;
+            for (; j >= 0 && (j + 1) % 4 != 0; --j) {
+                if (x[j] == max) { *s = j; return; }
+            }
+            const float32x4_t vm = vdupq_n_f32(max);
+            for (; j >= 3; j -= 4) {
+                if (vmaxvq_u32(vceqq_f32(vld1q_f32(x + j - 3), vm)) != 0) {
+                    for (int k = j; ; --k) {
+                        if (x[k] == max) { *s = k; return; }
+                    }
+                }
+            }
+        }
+    }
+#endif
     float max = -INFINITY;
     int idx = 0;
     for (int i = 0; i < n; ++i) {

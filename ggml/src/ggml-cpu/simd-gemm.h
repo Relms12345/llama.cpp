@@ -4,14 +4,30 @@
 
 #include "simd-mappings.h"
 
-// TODO: add support for sizeless vector types
-#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v_intrinsic)
+// SVE builds use NEON: the sizeless SVE types cannot be held in arrays
+#if defined(GGML_SIMD) && (!defined(__ARM_FEATURE_SVE) || defined(__ARM_NEON)) && !defined(__riscv_v_intrinsic)
+
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    #define SIMD_GEMM_VEC          float32x4_t
+    #define SIMD_GEMM_EPR          4
+    #define SIMD_GEMM_LOAD(p)      vld1q_f32(p)
+    #define SIMD_GEMM_STORE(p, v)  vst1q_f32(p, v)
+    #define SIMD_GEMM_SET1(x)      vdupq_n_f32(x)
+    #define SIMD_GEMM_FMA(a, b, c) vfmaq_f32(a, b, c)
+#else
+    #define SIMD_GEMM_VEC          GGML_F32_VEC
+    #define SIMD_GEMM_EPR          GGML_F32_EPR
+    #define SIMD_GEMM_LOAD(p)      GGML_F32_VEC_LOAD(p)
+    #define SIMD_GEMM_STORE(p, v)  GGML_F32_VEC_STORE(p, v)
+    #define SIMD_GEMM_SET1(x)      GGML_F32_VEC_SET1(x)
+    #define SIMD_GEMM_FMA(a, b, c) GGML_F32_VEC_FMA(a, b, c)
+#endif
 
 // TODO: untested on avx512
-// These are in units of GGML_F32_EPR
-#if defined(__AVX512F__) || defined (__ARM_NEON__)
+// These are in units of SIMD_GEMM_EPR
+#if defined(__AVX512F__) || defined(__ARM_NEON)
     static constexpr int GEMM_RM = 4;
-    static constexpr int GEMM_RN = 4; // 16+4+1 = 25/32
+    static constexpr int GEMM_RN = 4; // 16+4+1 = 21/32
 #elif defined(__AVX2__) || defined(__AVX__)
     static constexpr int GEMM_RM = 6;
     static constexpr int GEMM_RN = 2; // 12+2+1 = 15/16
@@ -27,31 +43,31 @@ static inline void simd_gemm_ukernel(
     const float * GGML_RESTRICT B,
     int K, int N)
 {
-    static constexpr int KN = GGML_F32_EPR;
+    static constexpr int KN = SIMD_GEMM_EPR;
 
-    GGML_F32_VEC acc[RM][RN];
+    SIMD_GEMM_VEC acc[RM][RN];
     for (int64_t i = 0; i < RM; i++) {
         for (int r = 0; r < RN; r++) {
-            acc[i][r] = GGML_F32_VEC_LOAD(C + i * N + r * KN);
+            acc[i][r] = SIMD_GEMM_LOAD(C + i * N + r * KN);
         }
     }
 
     for (int64_t kk = 0; kk < K; kk++) {
-        GGML_F32_VEC Bv[RN];
+        SIMD_GEMM_VEC Bv[RN];
         for (int r = 0; r < RN; r++) {
-            Bv[r] = GGML_F32_VEC_LOAD(B + kk * N + r * KN);
+            Bv[r] = SIMD_GEMM_LOAD(B + kk * N + r * KN);
         }
         for (int64_t i = 0; i < RM; i++) {
-            GGML_F32_VEC p = GGML_F32_VEC_SET1(A[i * K + kk]);
+            SIMD_GEMM_VEC p = SIMD_GEMM_SET1(A[i * K + kk]);
             for (int r = 0; r < RN; r++) {
-                acc[i][r] = GGML_F32_VEC_FMA(acc[i][r], Bv[r], p);
+                acc[i][r] = SIMD_GEMM_FMA(acc[i][r], Bv[r], p);
             }
         }
     }
 
     for (int64_t i = 0; i < RM; i++) {
         for (int r = 0; r < RN; r++) {
-            GGML_F32_VEC_STORE(C + i * N + r * KN, acc[i][r]);
+            SIMD_GEMM_STORE(C + i * N + r * KN, acc[i][r]);
         }
     }
 }
@@ -113,7 +129,7 @@ static void simd_gemm(
     const float * GGML_RESTRICT B,
     int M, int K, int N)
 {
-    static constexpr int KN = GGML_F32_EPR;
+    static constexpr int KN = SIMD_GEMM_EPR;
 
     int64_t ii = 0;
     for (; ii + GEMM_RM <= M; ii += GEMM_RM) {

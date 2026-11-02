@@ -1166,13 +1166,11 @@ ggml_kleidiai_kernels * ggml_kleidiai_select_kernels(cpu_feature cpu_features, c
     ggml_kleidiai_kernels * kernel = nullptr;
 
     if (tensor->op == GGML_OP_MUL_MAT && tensor->src[0] != nullptr && tensor->src[1] != nullptr) {
-        // BF16 weights use the F16 kernels: the F16 path converts the weights to F32 before packing them
-        const ggml_type rhs_type = tensor->src[0]->type == GGML_TYPE_BF16 ? GGML_TYPE_F16 : tensor->src[0]->type;
         auto try_table = [&](auto & table) {
             for (size_t i = 0; i < NELEMS(table) - 1; ++i) {
                 if ((cpu_features & table[i].required_cpu) == table[i].required_cpu &&
                     table[i].lhs_type == tensor->src[1]->type &&
-                    table[i].rhs_type == rhs_type &&
+                    table[i].rhs_type == tensor->src[0]->type &&
                     table[i].op_type  == tensor->type) {
                     kernel = &table[i];
                     return true;
@@ -1183,9 +1181,12 @@ ggml_kleidiai_kernels * ggml_kleidiai_select_kernels(cpu_feature cpu_features, c
 
         if (tensor->src[0]->type == GGML_TYPE_Q4_K) {
             try_table(gemm_gemv_kernels_q4_k);
-        } else if (tensor->src[0]->type == GGML_TYPE_Q8_0 || tensor->src[0]->type == GGML_TYPE_Q6_K) {
+        } else if (tensor->src[0]->type == GGML_TYPE_Q8_0 || tensor->src[0]->type == GGML_TYPE_Q6_K ||
+                   tensor->src[0]->type == GGML_TYPE_IQ4_XS || tensor->src[0]->type == GGML_TYPE_IQ4_NL ||
+                   tensor->src[0]->type == GGML_TYPE_IQ3_XXS || tensor->src[0]->type == GGML_TYPE_IQ3_S) {
+            // Q6_K and IQ weights are re-quantized to Q8 at load (the IQ ones only with GGML_KLEIDIAI_IQ)
             const ggml_type original_type = tensor->src[0]->type;
-            if (original_type == GGML_TYPE_Q6_K) {
+            if (original_type != GGML_TYPE_Q8_0) {
                 for (size_t i = 0; i < NELEMS(gemm_gemv_kernels_q8) - 1; ++i) {
                     if ((cpu_features & gemm_gemv_kernels_q8[i].required_cpu) == gemm_gemv_kernels_q8[i].required_cpu &&
                         gemm_gemv_kernels_q8[i].lhs_type == tensor->src[1]->type &&
@@ -1200,6 +1201,10 @@ ggml_kleidiai_kernels * ggml_kleidiai_select_kernels(cpu_feature cpu_features, c
             }
         } else if (tensor->src[0]->type == GGML_TYPE_F32) {
             try_table(ggml_kleidiai_kernels_f32);
+        } else if (tensor->src[0]->type == GGML_TYPE_BF16) {
+            if (tensor->src[1]->type == GGML_TYPE_F32 && tensor->type == GGML_TYPE_F32) {
+                kernel = ggml_kleidiai_select_kernels_bf16(cpu_features);
+            }
         } else {
             try_table(gemm_gemv_kernels);
         }
@@ -1258,4 +1263,15 @@ ggml_kleidiai_kernels * ggml_kleidiai_select_kernels_f32(cpu_feature features) {
         }
     }
     return kernels;
+}
+
+// BF16 weights use the F16 entry: its RHS packer takes F32 (exact for BF16) and packs to BF16
+ggml_kleidiai_kernels * ggml_kleidiai_select_kernels_bf16(cpu_feature features) {
+    for (size_t i = 0; i < NELEMS(gemm_gemv_kernels) - 1; ++i) {
+        if ((features & gemm_gemv_kernels[i].required_cpu) == gemm_gemv_kernels[i].required_cpu &&
+            gemm_gemv_kernels[i].rhs_type == GGML_TYPE_F16) {
+            return &gemm_gemv_kernels[i];
+        }
+    }
+    return nullptr;
 }

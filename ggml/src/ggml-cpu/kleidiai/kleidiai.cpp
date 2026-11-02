@@ -68,10 +68,12 @@ struct ggml_kleidiai_context {
     ggml_kleidiai_kernels * kernels_q4k;
     ggml_kleidiai_kernels * kernels_q8;
     ggml_kleidiai_kernels * kernels_f32;
+    ggml_kleidiai_kernels * kernels_bf16;
     int sme_thread_cap; // <= 0 means "SME disabled/unknown"
     int thread_hint;    // <= 0 means "no hint"
     int chunk_multiplier;
-} static ctx = { CPU_FEATURE_NONE, nullptr, nullptr, nullptr, nullptr, 0, -1, 4 };
+    bool iq_requant;    // GGML_KLEIDIAI_IQ: IQ weights re-quantized to per-row int8 (lossy)
+} static ctx = { CPU_FEATURE_NONE, nullptr, nullptr, nullptr, nullptr, nullptr, 0, -1, 4, false };
 
 static inline bool is_sme_family(cpu_feature f) {
     return (f & (CPU_FEATURE_SME | CPU_FEATURE_SME2)) != CPU_FEATURE_NONE;
@@ -314,6 +316,9 @@ static void init_kleidiai_context(void) {
         const char *env_sme         = getenv("GGML_KLEIDIAI_SME");
         const char *env_threads     = getenv("GGML_TOTAL_THREADS");
         const char *env_chunk_mult  = getenv("GGML_KLEIDIAI_CHUNK_MULTIPLIER");
+        const char *env_iq          = getenv("GGML_KLEIDIAI_IQ");
+
+        ctx.iq_requant = env_iq && atoi(env_iq) != 0;
 
         const auto runtime_feat = ggml_feats_get_arch64_runtime();
 
@@ -397,6 +402,7 @@ static void init_kleidiai_context(void) {
         ctx.kernels_q4k = ggml_kleidiai_select_kernels_q4_k(ctx.features);
         ctx.kernels_q8  = ggml_kleidiai_select_kernels_q8_0(ctx.features);
         ctx.kernels_f32 = ggml_kleidiai_select_kernels_f32(ctx.features);
+        ctx.kernels_bf16 = ggml_kleidiai_select_kernels_bf16(ctx.features);
 
         if (!ctx.kernels_q4) {
             GGML_LOG_INFO("kleidiai: no compatible q4 kernels found for CPU features mask %d\n", (int)ctx.features);
@@ -422,11 +428,16 @@ static void init_kleidiai_context(void) {
             GGML_LOG_INFO("kleidiai: primary f32 kernel feature %s\n", cpu_feature_to_string(ctx.kernels_f32->required_cpu));
         }
 
+        if (ctx.kernels_bf16) {
+            GGML_LOG_INFO("kleidiai: primary bf16 kernel feature %s\n", cpu_feature_to_string(ctx.kernels_bf16->required_cpu));
+        }
+
         const bool has_selected_sme_family_kernel =
             (ctx.kernels_q4  && is_sme_family(ctx.kernels_q4->required_cpu)) ||
             (ctx.kernels_q4k && is_sme_family(ctx.kernels_q4k->required_cpu)) ||
             (ctx.kernels_q8  && is_sme_family(ctx.kernels_q8->required_cpu)) ||
-            (ctx.kernels_f32 && is_sme_family(ctx.kernels_f32->required_cpu));
+            (ctx.kernels_f32 && is_sme_family(ctx.kernels_f32->required_cpu)) ||
+            (ctx.kernels_bf16 && is_sme_family(ctx.kernels_bf16->required_cpu));
         ctx.sme_thread_cap = has_selected_sme_family_kernel ? sme_cores : 0;
 
         if (has_selected_sme_family_kernel) {
@@ -439,6 +450,10 @@ static void init_kleidiai_context(void) {
             }
         } else {
             GGML_LOG_INFO("kleidiai: SME disabled\n");
+        }
+
+        if (ctx.iq_requant) {
+            GGML_LOG_INFO("kleidiai: IQ4_XS/IQ4_NL/IQ3_XXS/IQ3_S weights re-quantized to per-row int8 (GGML_KLEIDIAI_IQ)\n");
         }
     }
 
@@ -508,6 +523,25 @@ static inline kleidiai_block_args kleidiai_get_block_args(ggml_type rhs_type) {
         default:
             return { 0, 0, 0 };
     }
+}
+
+// weights dequantized at load and re-quantized to per-row int8 for the Q8 kernels (lossy)
+static inline bool kleidiai_is_requant_q8(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q6_K:
+            return true;
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+            return ctx.iq_requant;
+        default:
+            return false;
+    }
+}
+
+static inline bool kleidiai_is_q8_family(ggml_type type) {
+    return type == GGML_TYPE_Q8_0 || kleidiai_is_requant_q8(type);
 }
 
 static inline bool kleidiai_pack_fallback_allowed() {
@@ -649,6 +683,11 @@ static int kleidiai_collect_f32_chain(std::array<ggml_kleidiai_kernels *, GGML_K
         [&](cpu_feature mask) { return ggml_kleidiai_select_kernels_f32(mask); });
 }
 
+static int kleidiai_collect_bf16_chain(std::array<ggml_kleidiai_kernels *, GGML_KLEIDIAI_MAX_KERNEL_SLOTS> & out) {
+    return kleidiai_collect_kernel_chain_common(ctx.kernels_bf16, ctx.features, out,
+        [&](cpu_feature mask) { return ggml_kleidiai_select_kernels_bf16(mask); });
+}
+
 static inline int64_t ggml_ne(const ggml_tensor * tensor, int dim) {
     GGML_ASSERT(dim >= 0 && dim < GGML_MAX_DIMS);
     return tensor->ne[dim];
@@ -658,21 +697,6 @@ namespace ggml::cpu::kleidiai {
 
 static size_t round_down(size_t x, size_t y) {
     return y == 0 ? x : x - (x % y);
-}
-
-// BF16 -> F32 is exact: BF16 weights use the same packing and kernels as F16
-static void transpose_f32kxn_bf16nxk(size_t n, size_t k, float * dst, const uint16_t * src, size_t rhs_stride) {
-    size_t src_stride = rhs_stride / sizeof(uint16_t);
-    size_t dst_stride = n;
-
-    for (size_t k_idx = 0; k_idx < k; ++k_idx) {
-        for (size_t n_idx = 0; n_idx < n; ++n_idx) {
-            const uint32_t bits = (uint32_t) *(src + k_idx + n_idx * src_stride) << 16;
-            float v;
-            memcpy(&v, &bits, sizeof(v));
-            *(dst + n_idx + k_idx * dst_stride) = v;
-        }
-    }
 }
 
 static void transpose_f32kxn_f16nxk(size_t n, size_t k, float * dst, const uint16_t * src, size_t rhs_stride) {
@@ -705,7 +729,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
         const size_t m = op->src[1]->ne[1];
 
         if (op->src[0]->type == GGML_TYPE_Q4_0 || op->src[0]->type == GGML_TYPE_Q4_K ||
-            op->src[0]->type == GGML_TYPE_Q8_0 || op->src[0]->type == GGML_TYPE_Q6_K) {
+            kleidiai_is_q8_family(op->src[0]->type)) {
             const kleidiai_block_args block_args = kleidiai_get_block_args(kernel_chain[0]->rhs_type);
             const size_t qk = block_args.pack_bl;
 
@@ -740,7 +764,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
             return true;
         }
 
-        if (op->src[0]->type == GGML_TYPE_F32) {
+        if (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) {
             ggml_kleidiai_kernels * primary     = kernel_chain[0];
             kernel_info *           gemv_kernel = primary ? &primary->gemv : nullptr;
             if (is_gemv && op->src[1]->nb[0] == (int64_t) sizeof(float) && gemv_kernel &&
@@ -779,7 +803,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
             return true;
         }
 
-        if (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16) {
+        if (op->src[0]->type == GGML_TYPE_F16) {
             const int64_t lhs_batch_size0 = op->src[1]->ne[2];
             const int64_t rhs_batch_size0 = op->src[0]->ne[2];
             GGML_ASSERT(rhs_batch_size0 > 0);
@@ -834,19 +858,20 @@ class tensor_traits : public ggml::cpu::tensor_traits {
     bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * dst) override {
         if (dst->op == GGML_OP_MUL_MAT) {
             if (dst->src[0]->type == GGML_TYPE_Q4_0 || dst->src[0]->type == GGML_TYPE_Q4_K ||
-                dst->src[0]->type == GGML_TYPE_Q8_0 || dst->src[0]->type == GGML_TYPE_Q6_K) {
+                kleidiai_is_q8_family(dst->src[0]->type)) {
                 return compute_forward_qx(params, dst);
-            } else if (dst->src[0]->type == GGML_TYPE_F32) {
+            } else if (dst->src[0]->type == GGML_TYPE_F32 || dst->src[0]->type == GGML_TYPE_BF16) {
                 return compute_forward_f32(params, dst);
-            } else if (dst->src[0]->type == GGML_TYPE_F16 || dst->src[0]->type == GGML_TYPE_BF16) {
+            } else if (dst->src[0]->type == GGML_TYPE_F16) {
                 return compute_forward_fp16(params, dst);
             }
         }
         return false;
     }
 
+    // F32 weights, or BF16 weights packed at load: both are in the KleidiAI buffer
     bool compute_forward_f32(ggml_compute_params * params, struct ggml_tensor * dst) {
-        GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+        GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32 || dst->src[0]->type == GGML_TYPE_BF16);
 
         const ggml_tensor * src0 = dst->src[0];
         const ggml_tensor * src1 = dst->src[1];
@@ -857,7 +882,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
             return false;
         }
 
-        ggml_kleidiai_kernels * kernels = kleidiai_primary_kernel_f32();
+        ggml_kleidiai_kernels * kernels = src0->type == GGML_TYPE_BF16 ? ctx.kernels_bf16 : kleidiai_primary_kernel_f32();
         if (!kernels) {
             return false;
         }
@@ -959,10 +984,16 @@ class tensor_traits : public ggml::cpu::tensor_traits {
 
             ggml_barrier(params->threadpool);
 
-            const size_t chunk_cols = kleidiai_chunk_cols(n, nth, disable_chunking, n_step);
+            // SME units are shared between cores: only sme_thread_cap threads run the SME kernel
+            int nth_kernel = nth;
+            if (is_sme_family(kernels->required_cpu) && ctx.sme_thread_cap > 0) {
+                nth_kernel = std::min(nth, ctx.sme_thread_cap);
+            }
+
+            const size_t chunk_cols = kleidiai_chunk_cols(n, nth_kernel, disable_chunking, n_step);
             GGML_ASSERT(chunk_cols <= (size_t) INT_MAX);
 
-            int current_col = ggml_threadpool_chunk_add(params->threadpool, (int) chunk_cols);
+            int current_col = ith < nth_kernel ? ggml_threadpool_chunk_add(params->threadpool, (int) chunk_cols) : (int) n;
             while ((size_t) current_col < n) {
                 const size_t n_start = (size_t) current_col;
                 const size_t n_to_process = std::min(chunk_cols, n - n_start);
@@ -1103,17 +1134,10 @@ class tensor_traits : public ggml::cpu::tensor_traits {
             // RHS packing (single thread), then synchronize
             if (ith == 0) {
                 memset(bias, 0, (size_t)n * sizeof(float));
-                if (src0->type == GGML_TYPE_BF16) {
-                    transpose_f32kxn_bf16nxk((size_t)n, (size_t)k,
-                                            reinterpret_cast<float *>(rhs_kxn),
-                                            reinterpret_cast<const uint16_t *>(rhs_batch_base),
-                                            rhs_stride);
-                } else {
-                    transpose_f32kxn_f16nxk((size_t)n, (size_t)k,
-                                            reinterpret_cast<float *>(rhs_kxn),
-                                            reinterpret_cast<const uint16_t *>(rhs_batch_base),
-                                            rhs_stride);
-                }
+                transpose_f32kxn_f16nxk((size_t)n, (size_t)k,
+                                        reinterpret_cast<float *>(rhs_kxn),
+                                        reinterpret_cast<const uint16_t *>(rhs_batch_base),
+                                        rhs_stride);
 
                 kernels->rhs_info.pack_func_ex(1, n, k, nr, kr, sr, 0, n * sizeof(float),
                              rhs_kxn, bias, nullptr, rhs_packed, 0, nullptr);
@@ -1159,7 +1183,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
 
     bool compute_forward_qx(struct ggml_compute_params * params, struct ggml_tensor * dst) {
         GGML_ASSERT(dst->src[0]->type == GGML_TYPE_Q4_0 || dst->src[0]->type == GGML_TYPE_Q4_K ||
-                    dst->src[0]->type == GGML_TYPE_Q8_0 || dst->src[0]->type == GGML_TYPE_Q6_K);
+                    kleidiai_is_q8_family(dst->src[0]->type));
 
         const ggml_tensor * src0 = dst->src[0];
         const ggml_tensor * src1 = dst->src[1];
@@ -1516,8 +1540,8 @@ class tensor_traits : public ggml::cpu::tensor_traits {
 public:
     int repack(struct ggml_tensor * tensor, const void * data, size_t data_size) {
         GGML_ASSERT(tensor->type == GGML_TYPE_Q4_0 || tensor->type == GGML_TYPE_Q4_K ||
-                    tensor->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_Q6_K ||
-                    tensor->type == GGML_TYPE_F32);
+                    kleidiai_is_q8_family(tensor->type) ||
+                    tensor->type == GGML_TYPE_F32  || tensor->type == GGML_TYPE_BF16);
         const size_t n = tensor->ne[1];
         const size_t k = tensor->ne[0];
 
@@ -1536,9 +1560,12 @@ public:
 
         std::array<ggml_kleidiai_kernels *, GGML_KLEIDIAI_MAX_KERNEL_SLOTS> kernel_chain;
         const bool want_q4k = tensor->type == GGML_TYPE_Q4_K;
-        const bool want_q8 = tensor->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_Q6_K;
+        const bool want_q8 = kleidiai_is_q8_family(tensor->type);
+        const bool requant = kleidiai_is_requant_q8(tensor->type);
         const bool want_f32 = tensor->type == GGML_TYPE_F32;
+        const bool want_bf16 = tensor->type == GGML_TYPE_BF16;
         const int slot_total = want_f32 ? kleidiai_collect_f32_chain(kernel_chain)
+                                        : want_bf16 ? kleidiai_collect_bf16_chain(kernel_chain)
                                         : want_q8 ? kleidiai_collect_q8_chain(kernel_chain)
                                         : want_q4k ? kleidiai_collect_q4k_chain(kernel_chain)
                                                    : kleidiai_collect_q4_chain(kernel_chain);
@@ -1556,22 +1583,24 @@ public:
             const size_t row_stride = tensor->nb[1];
             const size_t k_blocks   = (k + QK8_0 - 1) / QK8_0;
 
-            if (tensor->type == GGML_TYPE_Q6_K) {
-                if (k % QK_K != 0 || k % QK8_0 != 0) {
+            if (requant) {
+                if (k % QK8_0 != 0) {
                     return -1;
                 }
                 row_f32.resize(k);
             }
 
+            const ggml_to_float_t to_float = requant ? ggml_get_type_traits(tensor->type)->to_float : nullptr;
+
             for (size_t row = 0; row < n; ++row) {
                 const uint8_t * row_data = static_cast<const uint8_t *>(data) + row * row_stride;
 
-                if (tensor->type == GGML_TYPE_Q6_K) {
-                    dequantize_row_q6_K(reinterpret_cast<const block_q6_K *>(row_data), row_f32.data(), k);
+                if (requant) {
+                    to_float(row_data, row_f32.data(), k);
                 }
 
                 float max_abs = 0.0f;
-                if (tensor->type == GGML_TYPE_Q6_K) {
+                if (requant) {
                     for (size_t linear_idx = 0; linear_idx < k; ++linear_idx) {
                         max_abs = std::max(max_abs, std::fabs(row_f32[linear_idx]));
                     }
@@ -1595,7 +1624,7 @@ public:
                 scales[row] = scale;
                 const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
 
-                if (tensor->type == GGML_TYPE_Q6_K) {
+                if (requant) {
                     for (size_t linear_idx = 0; linear_idx < k; ++linear_idx) {
                         int32_t q = scale > 0.0f ? static_cast<int32_t>(std::lround(row_f32[linear_idx] * inv_scale)) : 0;
                         q = std::clamp(q, -127, 127);
@@ -1621,7 +1650,7 @@ public:
             }
         }
 
-        if (want_f32 && slot_total > 0) {
+        if ((want_f32 || want_bf16) && slot_total > 0) {
             bias.resize(n, 0.0f);
         }
 
@@ -1648,7 +1677,7 @@ public:
             const size_t block_len = rhs_type == GGML_TYPE_Q8_0 ? QK8_0 :
                                      rhs_type == GGML_TYPE_Q4_0 ? QK4_0 :
                                      rhs_type == GGML_TYPE_Q4_K ? GGML_KLEIDIAI_Q4_K_BL :
-                                     rhs_type == GGML_TYPE_F32 ? 0 : SIZE_MAX;
+                                     rhs_type == GGML_TYPE_F32 || rhs_type == GGML_TYPE_F16 ? 0 : SIZE_MAX;
             if (block_len == SIZE_MAX) {
                 continue;
             }
@@ -1679,6 +1708,21 @@ public:
                 rhs_info->pack_func_ex(1, n, k, nr, kr, sr, 0, tensor->nb[1],
                                        data, bias.data(), nullptr,
                                        dst_ptr, 0, nullptr);
+            } else if (rhs_type == GGML_TYPE_F16 && want_bf16) {
+                // the packer wants K x N F32: widen nr rows at a time, packed blocks of nr columns are independent
+                std::vector<float> tile(k * nr);
+                for (size_t n0 = 0; n0 < n; n0 += nr) {
+                    const size_t nc = std::min(nr, n - n0);
+                    for (size_t j = 0; j < nc; ++j) {
+                        const ggml_bf16_t * row = reinterpret_cast<const ggml_bf16_t *>(static_cast<const uint8_t *>(data) + (n0 + j) * tensor->nb[1]);
+                        for (size_t i = 0; i < k; ++i) {
+                            tile[i * nc + j] = GGML_BF16_TO_FP32(row[i]);
+                        }
+                    }
+                    rhs_info->pack_func_ex(1, nc, k, nr, kr, sr, 0, nc * sizeof(float),
+                                           tile.data(), bias.data() + n0, nullptr,
+                                           dst_ptr + kernel->get_rhs_packed_offset_ex(n0, k, 0), 0, nullptr);
+                }
             } else {
                 continue;
             }
@@ -1753,8 +1797,8 @@ static size_t ggml_backend_cpu_kleidiai_buffer_type_get_alloc_size(ggml_backend_
     GGML_UNUSED(buft);
 
     if (tensor->type != GGML_TYPE_Q4_0 && tensor->type != GGML_TYPE_Q4_K &&
-        tensor->type != GGML_TYPE_Q8_0 && tensor->type != GGML_TYPE_Q6_K &&
-        tensor->type != GGML_TYPE_F32) {
+        !kleidiai_is_q8_family(tensor->type) &&
+        tensor->type != GGML_TYPE_F32  && tensor->type != GGML_TYPE_BF16) {
         return ggml_nbytes(tensor);
     }
 
@@ -1766,9 +1810,11 @@ static size_t ggml_backend_cpu_kleidiai_buffer_type_get_alloc_size(ggml_backend_
 
     std::array<ggml_kleidiai_kernels *, GGML_KLEIDIAI_MAX_KERNEL_SLOTS> kernel_chain;
     const bool want_q4k = tensor->type == GGML_TYPE_Q4_K;
-    const bool want_q8 = tensor->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_Q6_K;
+    const bool want_q8 = kleidiai_is_q8_family(tensor->type);
     const bool want_f32 = tensor->type == GGML_TYPE_F32;
+    const bool want_bf16 = tensor->type == GGML_TYPE_BF16;
     const int slot_total = want_f32 ? kleidiai_collect_f32_chain(kernel_chain)
+                                    : want_bf16 ? kleidiai_collect_bf16_chain(kernel_chain)
                                     : want_q8 ? kleidiai_collect_q8_chain(kernel_chain)
                                     : want_q4k ? kleidiai_collect_q4k_chain(kernel_chain)
                                                : kleidiai_collect_q4_chain(kernel_chain);
@@ -1793,7 +1839,7 @@ static size_t ggml_backend_cpu_kleidiai_buffer_type_get_alloc_size(ggml_backend_
         const size_t block_len = rhs_type == GGML_TYPE_Q4_0 ? QK4_0 :
                                  rhs_type == GGML_TYPE_Q4_K ? GGML_KLEIDIAI_Q4_K_BL :
                                  rhs_type == GGML_TYPE_Q8_0 ? QK8_0 :
-                                 rhs_type == GGML_TYPE_F32 ? 0 : SIZE_MAX;
+                                 rhs_type == GGML_TYPE_F32 || rhs_type == GGML_TYPE_F16 ? 0 : SIZE_MAX;
         if (block_len == SIZE_MAX) {
             continue;
         }
@@ -1827,8 +1873,8 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             slot_total > 0;
 
         if ((op->src[0]->type == GGML_TYPE_Q4_0 || op->src[0]->type == GGML_TYPE_Q4_K ||
-             op->src[0]->type == GGML_TYPE_Q8_0 || op->src[0]->type == GGML_TYPE_Q6_K ||
-             op->src[0]->type == GGML_TYPE_F32) &&
+             kleidiai_is_q8_family(op->src[0]->type) ||
+             op->src[0]->type == GGML_TYPE_F32  || op->src[0]->type == GGML_TYPE_BF16) &&
             src0_is_kleidiai) {
             if (op->src[0]->type == GGML_TYPE_Q4_0 && ctx.kernels_q4 == nullptr) {
                 return false;
@@ -1836,13 +1882,16 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             if (op->src[0]->type == GGML_TYPE_Q8_0 && ctx.kernels_q8 == nullptr) {
                 return false;
             }
-            if (op->src[0]->type == GGML_TYPE_Q6_K && ctx.kernels_q8 == nullptr) {
+            if (kleidiai_is_requant_q8(op->src[0]->type) && ctx.kernels_q8 == nullptr) {
                 return false;
             }
             if (op->src[0]->type == GGML_TYPE_Q4_K && ctx.kernels_q4k == nullptr) {
                 return false;
             }
             if (op->src[0]->type == GGML_TYPE_F32 && ctx.kernels_f32 == nullptr) {
+                return false;
+            }
+            if (op->src[0]->type == GGML_TYPE_BF16 && (ctx.kernels_bf16 == nullptr || op->src[1]->nb[0] != sizeof(float))) {
                 return false;
             }
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
@@ -1858,8 +1907,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                        (op->src[1]->ne[1] == 1 || op->src[1]->nb[1] == op->src[1]->ne[0] * sizeof(float));
             }
 
-            if (op->src[0]->type == GGML_TYPE_Q4_0 || op->src[0]->type == GGML_TYPE_Q8_0 ||
-                op->src[0]->type == GGML_TYPE_Q6_K) {
+            if (op->src[0]->type == GGML_TYPE_Q4_0 || kleidiai_is_q8_family(op->src[0]->type)) {
                 if (op->src[1]->type == GGML_TYPE_F32 &&
                     ggml_ne(op->src[1], 3) == 1) {
                     return true;
@@ -1897,7 +1945,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                                       ggml_type_name(op->src[0]->type));
                     }
                 }
-                if (op->src[0]->type != GGML_TYPE_F16 && op->src[0]->type != GGML_TYPE_BF16) {
+                if (op->src[0]->type != GGML_TYPE_F16) {
                     return nullptr;
                 }
                 std::array<ggml_kleidiai_kernels *, GGML_KLEIDIAI_MAX_KERNEL_SLOTS> kernel_chain;
