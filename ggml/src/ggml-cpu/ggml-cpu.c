@@ -3010,26 +3010,33 @@ static void ggml_cpu_detect_perf_cores(struct ggml_cpu_perf_cores * pc) {
     long cap_min = LONG_MAX;
 
     const int n_max = GGML_MAX_N_THREADS < CPU_SETSIZE ? GGML_MAX_N_THREADS : CPU_SETSIZE;
-    for (int cpu = 0; cpu < n_max; cpu++) {
-        if (!CPU_ISSET(cpu, &allowed)) {
-            continue;
+    // Use a complete set of one metric: capacity units and frequencies are not comparable.
+    const char * metrics[] = { "cpu_capacity", "cpufreq/cpuinfo_max_freq" };
+    for (size_t metric = 0; metric < sizeof(metrics)/sizeof(metrics[0]); metric++) {
+        n = 0;
+        cap_max = 0;
+        cap_min = LONG_MAX;
+        bool complete = true;
+        for (int cpu = 0; cpu < n_max; cpu++) {
+            if (!CPU_ISSET(cpu, &allowed)) {
+                continue;
+            }
+            char path[128];
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/%s", cpu, metrics[metric]);
+            const long cap = ggml_read_sysfs_long(path);
+            if (cap <= 0) {
+                complete = false;
+                break;
+            }
+            cpus[n] = cpu;
+            caps[n++] = cap;
+            cap_max = cap > cap_max ? cap : cap_max;
+            cap_min = cap < cap_min ? cap : cap_min;
         }
-        char path[128];
-        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpu_capacity", cpu);
-        long cap = ggml_read_sysfs_long(path);
-        if (cap <= 0) {
-            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
-            cap = ggml_read_sysfs_long(path);
+        if (complete && n >= 2 && cap_max != cap_min) {
+            break;
         }
-        if (cap <= 0) {
-            // topology unknown - do not guess
-            return;
-        }
-        cpus[n] = cpu;
-        caps[n] = cap;
-        n++;
-        cap_max = cap > cap_max ? cap : cap_max;
-        cap_min = cap < cap_min ? cap : cap_min;
+        n = 0;
     }
 
     if (n < 2 || cap_max == cap_min) {
@@ -3050,17 +3057,13 @@ static void ggml_cpu_detect_perf_cores(struct ggml_cpu_perf_cores * pc) {
         caps[j + 1] = cp;
     }
 
-    // performance cores: at least half the capacity of the fastest core
+    // Exclude the slowest tier, including when it is above half the fastest core's capacity.
+    // Retain the half-capacity floor so very small cores cannot enter the performance set.
     for (int i = 0; i < n; i++) {
-        if (2*caps[i] < cap_max) {
+        if (caps[i] == cap_min || 2*caps[i] < cap_max) {
             break;
         }
         pc->order[pc->n_perf++] = cpus[i];
-    }
-
-    if (pc->n_perf == n) {
-        // nothing to exclude
-        pc->n_perf = 0;
     }
 }
 #else
